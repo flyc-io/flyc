@@ -166,6 +166,11 @@ s'il s'agit d'un hôte de file, retrait de la configuration des LB, mise hors se
 l'inventaire, convergence des nœuds restants. `tools/add-node.sh` fait exactement la même chose
 depuis un poste, pour qui préfère la ligne de commande.
 
+Tout cela se pilote aussi bien par l'API que par l'interface, qui ne fait rien d'autre que
+l'appeler : `POST /v1/enroll/tokens`, `POST /v1/nodes`, puis les tâches d'installation. La séquence
+complète, commande par commande, est dans `docs/api.md` (« Ajouter un hôte de file, de bout en
+bout »).
+
 Les tâches s'exécutent sur l'hôte control, dans le runner : fermer l'onglet ne les interrompt pas,
 et la page Tâches permet de rouvrir n'importe quel journal.
 
