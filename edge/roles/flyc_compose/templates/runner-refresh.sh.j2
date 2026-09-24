@@ -1,0 +1,47 @@
+#!/bin/sh
+# Remplace le conteneur flyc-runner — après la tâche en cours s'il y en a une.
+#
+# Un runner ne peut pas se remplacer lui-même : « docker compose up » recrée le conteneur, donc tue
+# le playbook qui vient de demander cette recréation (constaté en test : tâche terminée en SIGTERM
+# au moment précis où le conteneur était recréé). Le rôle flyc_compose écarte donc flyc-runner du
+# « compose up » et confie son remplacement à ce script, lancé par systemd : lui survit au conteneur.
+#
+# Déposé par Ansible — ne pas modifier à la main.
+set -eu
+
+JOBS="{{ flyc_data_dir }}/jobs"
+INSTALL="{{ flyc_install_dir }}"
+PAUSE="$JOBS/.paused"
+ATTENTE_MAX=3600        # une heure : au-delà, ce n'est plus une tâche mais un blocage
+
+# Un autre remplacement peut attendre en même temps : ne pas lever la pause sous ses pieds.
+liberer() {
+  if ! pgrep -f '[r]unner-refresh.sh' | grep -vx "$$" >/dev/null 2>&1; then
+    rm -f "$PAUSE"
+  fi
+}
+trap liberer EXIT INT TERM
+
+mkdir -p "$JOBS"
+: > "$PAUSE"            # à partir d'ici le runner ne prend plus de nouvelle tâche
+
+occupe() {
+  for c in "$JOBS"/*.claim; do
+    [ -e "$c" ] || continue
+    [ -e "${c%.claim}.result.json" ] || return 0
+  done
+  return 1
+}
+
+limite=$(( $(date +%s) + ATTENTE_MAX ))
+while occupe; do
+  if [ "$(date +%s)" -ge "$limite" ]; then
+    echo "tâche toujours en cours après ${ATTENTE_MAX}s : remplacement abandonné" >&2
+    exit 1
+  fi
+  touch "$PAUSE"        # la pause reste fraîche tant que ce script vit
+  sleep 5
+done
+
+cd "$INSTALL"
+docker compose {{ flyc_compose_profiles | map('regex_replace', '^', '--profile ') | join(' ') }} up -d flyc-runner

@@ -1,0 +1,5 @@
+---
+haproxy_wait_dir: "{{ haproxy_etc }}/wait"
+haproxy_ssl_dir: "{{ haproxy_etc }}/ssl"
+haproxy_maps_dir: "{{ haproxy_etc }}/maps"
+haproxy_flyc_dir: "{{ haproxy_etc }}/flyc"

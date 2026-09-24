@@ -1,0 +1,257 @@
+---
+# Met hors service un nœud retiré de la plateforme, à deux niveaux.
+#
+#   inert (défaut) : les services sont arrêtés ET désactivés, les VIP retirées de la boucle locale.
+#                    Tout reste installé : le nœud ne peut plus revenir dans le pool tout seul après
+#                    un redémarrage, et `tools/add-node.sh` le remet en service en un run.
+#   purge          : en plus, paquets, configurations, données et règles de pare-feu sont supprimés.
+#                    La machine redevient une Ubuntu vierge.
+#
+# Sans cela, un LB simplement sorti de l'inventaire garde BIRD et HAProxy activés au démarrage :
+# au premier redémarrage il réannonce les VIP et sert une configuration figée.
+#
+#   ansible-playbook -i <inv> tools/decommission-node.yml -l <hôte> [-e decommission_level=purge]
+- name: Mise hors service d'un nœud
+  hosts: all
+  gather_facts: false
+  become: true
+  vars:
+    decommission_level: inert
+    flyc_services_edge: [haproxy, bird, dataplaneapi]
+  # Les chemins et ports viennent du même endroit que pour le déploiement : sans ce rôle,
+  # flyc_install_dir et consorts sont indéfinis ici.
+  roles:
+    - role: flyc_defaults
+  tasks:
+    - name: Niveau valide
+      ansible.builtin.assert:
+        that: decommission_level in ['inert', 'purge']
+        fail_msg: "decommission_level : inert ou purge"
+
+    - name: Un seul hôte à la fois (utiliser -l)
+      ansible.builtin.assert:
+        that: ansible_play_hosts | length == 1
+        fail_msg: >-
+          {{ ansible_play_hosts | length }} hôtes visés : limiter le play à un seul nœud avec -l.
+
+    # Une machine peut porter plusieurs rôles (l'assistant propose data sur le premier hôte de
+    # file, le profil all-in-one les cumule). Mettre hors service « l'hôte » arrêterait alors des
+    # fonctions qu'on ne voulait pas toucher, et la purge effacerait leurs données. On refuse.
+    - name: Rôles de cet hôte
+      ansible.builtin.set_fact:
+        flyc_roles: "{{ ['edge', 'queue', 'data'] | select('in', group_names) | list }}"
+
+    - name: Un seul rôle sur cet hôte
+      ansible.builtin.assert:
+        that: flyc_roles | length == 1
+        fail_msg: >-
+          {{ inventory_hostname }} porte {{ flyc_roles | join(' et ') }} : mettre cet hôte hors
+          service arrêterait aussi les autres fonctions. Les déplacer d'abord sur une autre machine.
+
+    - name: Rôle attendu
+      ansible.builtin.assert:
+        that: decommission_role is not defined or (decommission_role | replace('lb', 'edge')) in flyc_roles
+        fail_msg: >-
+          rôle demandé « {{ decommission_role | default('?') }} » absent de cet hôte ({{ flyc_roles | join(', ') }}).
+
+    - name: Raccourcis
+      ansible.builtin.set_fact:
+        is_edge: "{{ 'edge' in flyc_roles }}"
+        is_compose: "{{ 'queue' in flyc_roles or 'data' in flyc_roles }}"
+
+    # ---- arrêt des services -------------------------------------------------------------------
+    - name: Services edge arrêtés et désactivés
+      ansible.builtin.systemd_service:
+        name: "{{ item }}"
+        state: stopped
+        enabled: false
+      loop: "{{ flyc_services_edge }}"
+      register: svc_stop
+      # Seul cas toléré : l'unité n'existe pas (déjà purgée). systemd le dit de plusieurs façons,
+      # d'où les trois formulations ; tout autre échec doit arrêter le retrait.
+      failed_when:
+        - svc_stop is failed
+        - not (svc_stop.msg | default('') | lower is search('could not find|could not be found|not found|no such file'))
+      when: is_edge | bool
+
+    - name: Aucun service edge ne tourne encore
+      ansible.builtin.command: "systemctl is-active {{ item }}"
+      register: svc_check
+      changed_when: false
+      failed_when: svc_check.stdout | trim == 'active'
+      loop: "{{ flyc_services_edge }}"
+      when: is_edge | bool
+
+    # shell et non command : « command » est une primitive du shell, il n'existe aucun binaire de
+    # ce nom. Avec le module command la tâche échouait donc toujours — sans bruit, à cause du
+    # failed_when: false — et l'arrêt des conteneurs était sauté sur tout hôte de file. Seul le
+    # contrôle des ports, en fin de playbook, rattrapait la chose.
+    - name: Docker présent ?
+      ansible.builtin.shell: command -v docker
+      register: docker_bin
+      changed_when: false
+      failed_when: false
+      when: is_compose | bool
+
+    # « --profile "*" » est indispensable : sans lui, « down » ignore les services dont le profil
+    # n'est pas activé — donc, sur un hôte de file, exactement ceux qu'on veut arrêter. Constaté en
+    # test : la commande renvoyait 0 en laissant flyc-queue et les deux Redis debout.
+    - name: Conteneurs Flyc arrêtés
+      ansible.builtin.command:
+        cmd: docker compose --project-directory {{ flyc_install_dir }} --profile "*" down --remove-orphans
+      register: compose_down
+      changed_when: compose_down.rc == 0
+      when: is_compose | bool and docker_bin.rc | default(1) == 0
+
+    # Le détail est dans files/docker-purge.sh : écrit en ligne ici, son mélange de guillemets
+    # empêchait Ansible d'analyser la tâche et le playbook ne se chargeait plus.
+    - name: Ressources Docker de Flyc supprimées (purge)
+      ansible.builtin.script: "files/docker-purge.sh {{ flyc_install_dir }}"
+      register: docker_purge
+      changed_when: true
+      when: decommission_level == 'purge' and (is_compose | bool)
+
+    # Docker n'est désinstallé, et ses données effacées, que s'il ne sert plus à rien d'autre.
+    - name: Docker était-il dédié à Flyc ?
+      ansible.builtin.set_fact:
+        docker_dedie: "{{ 'docker_dedie=oui' in (docker_purge.stdout | default('')) }}"
+
+    - name: Docker conservé (la machine héberge autre chose)
+      ansible.builtin.debug:
+        msg: >-
+          Des conteneurs étrangers à Flyc tournent ici : Docker, ses images et /var/lib/docker
+          sont laissés en place. Seules les ressources Flyc ont été supprimées.
+      when: decommission_level == 'purge' and (is_compose | bool) and not (docker_dedie | default(false))
+
+    # ---- VIP et routage (edge) ----------------------------------------------------------------
+    # Les VIP doivent partir de la boucle locale : sinon la machine répond encore localement et,
+    # si BIRD repart un jour, elle réannonce des adresses qu'elle ne sert plus correctement.
+    - name: VIP retirées de netplan
+      ansible.builtin.file:
+        path: /etc/netplan/60-flyc-vip.yaml
+        state: absent
+      register: netplan_gone
+      when: is_edge | bool
+
+    - name: Drop-ins de routage des VIP retirés
+      ansible.builtin.shell: |
+        find /etc/systemd/network -mindepth 2 -maxdepth 2 -name flyc-vip.conf -printf '%h\n' -delete
+      register: dropins_gone
+      changed_when: dropins_gone.stdout | trim | length > 0
+      when: is_edge | bool
+
+    - name: Configuration réseau rechargée
+      ansible.builtin.shell: |
+        netplan apply || true
+        networkctl reload || true
+        for a in $(ip -o addr show lo | awk '{print $4}' | grep -vE '^127\.0\.0\.1|^::1'); do ip addr del "$a" dev lo; done
+        ip -4 route flush table {{ flyc_vip_route_table | default(100) }} 2>/dev/null || true
+        ip -6 route flush table {{ flyc_vip_route_table | default(100) }} 2>/dev/null || true
+        for p in $(ip -4 rule show | awk '/lookup {{ flyc_vip_route_table | default(100) }}/{print $1}' | tr -d :); do ip -4 rule del pref "$p" || true; done
+        for p in $(ip -6 rule show | awk '/lookup {{ flyc_vip_route_table | default(100) }}/{print $1}' | tr -d :); do ip -6 rule del pref "$p" || true; done
+      changed_when: true
+      when: is_edge | bool and (netplan_gone.changed or dropins_gone.changed)
+
+    # ---- purge ---------------------------------------------------------------------------------
+    - name: Paquets Flyc purgés
+      ansible.builtin.apt:
+        name: "{{ ['haproxy', 'bird2', 'dataplaneapi', 'prometheus-node-exporter']
+                  + (['docker-ce', 'docker-ce-cli', 'containerd.io', 'docker-buildx-plugin',
+                      'docker-compose-plugin'] if (docker_dedie | default(false)) else []) }}"
+        state: absent
+        purge: true
+        autoremove: true
+        lock_timeout: 600
+      when: decommission_level == 'purge'
+
+    - name: Dépôts et clés retirés
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - /etc/apt/sources.list.d/docker.list
+        - /etc/apt/keyrings/docker.asc
+        - /usr/local/share/ca-certificates/flyc-registry-ca.crt
+        - /etc/apt/apt.conf.d/99-flyc
+      when: decommission_level == 'purge'
+
+    - name: Dépôt HAProxy (PPA) retiré
+      ansible.builtin.shell: rm -f /etc/apt/sources.list.d/*haproxy* /etc/apt/trusted.gpg.d/*haproxy*
+      changed_when: true
+      when: decommission_level == 'purge'
+
+    - name: Fichiers et données Flyc supprimés
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - "{{ haproxy_etc | default('/etc/haproxy') }}"
+        - /etc/bird
+        - /etc/dataplaneapi
+        - /var/lib/dataplaneapi
+        - /etc/default/dataplaneapi
+        - /var/log/dataplaneapi.log
+        - /etc/rsyslog.d/48-flyc-haproxy.conf
+        - /etc/logrotate.d/flyc-haproxy
+        - /etc/modules-load.d/flyc.conf
+        - /etc/sysctl.d/90-flyc.conf
+        - /etc/sysctl.d/91-flyc-kernel.conf
+        - "{{ flyc_install_dir | default('/opt/flyc') }}"
+        - "{{ flyc_data_dir | default('/var/lib/flyc') }}"
+      when: decommission_level == 'purge'
+
+    - name: Données Docker supprimées (seulement s'il était dédié à Flyc)
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - /etc/docker
+        - /var/lib/docker
+        - /var/lib/containerd
+        - /etc/systemd/system/docker.service.d
+      when: decommission_level == 'purge' and (docker_dedie | default(false))
+
+    # Jamais « ufw --force reset » : il effacerait les règles de l'administrateur et couperait
+    # des services sans rapport. Seules les règles marquées flyc sont retirées.
+    - name: Règles de pare-feu Flyc retirées
+      ansible.builtin.script: files/ufw-flyc-purge.sh
+      register: ufw_purge
+      changed_when: "'0 règle' not in (ufw_purge.stdout | default(''))"
+      when: decommission_level == 'purge' and (flyc_manage_firewall | default(true) | bool)
+
+    - name: Utilisateur système flyc retiré
+      ansible.builtin.user:
+        name: flyc
+        state: absent
+        remove: true
+      when: decommission_level == 'purge'
+
+    - name: Réglages noyau et certificats rafraîchis
+      ansible.builtin.shell: sysctl --system >/dev/null 2>&1; update-ca-certificates --fresh >/dev/null 2>&1; true
+      changed_when: false
+      when: decommission_level == 'purge'
+
+    # Le vrai critère : plus aucun service Flyc ne répond. C'est ce contrôle qui rattrape un
+    # conteneur resté vivant derrière un démon arrêté.
+    - name: Ports Flyc attendus fermés
+      ansible.builtin.shell: >-
+        ss -ltnH | awk '{print $4}' | sed 's/.*://' | sort -u
+        | grep -xE '{{ flyc_ports_attendus | join("|") }}' || true
+      register: ports_ouverts
+      changed_when: false
+      failed_when: ports_ouverts.stdout | trim | length > 0
+      vars:
+        flyc_ports_attendus: >-
+          {{ ([80, 443, flyc_dataplane_port, flyc_stats_port, flyc_peers_port] if (is_edge | bool) else [])
+             + ([flyc_queue_port, flyc_control_port] + flyc_redis_node_ports + flyc_redis_node_bus_ports
+                if (is_compose | bool) else []) | map('string') | list }}
+
+    - name: Résultat
+      ansible.builtin.debug:
+        msg: >-
+          {{ inventory_hostname }} mis hors service ({{ decommission_level }}){{
+          " : services arrêtés et désactivés, VIP retirées ; tout reste installé"
+          if decommission_level == 'inert'
+          else " : paquets, configurations et données Flyc supprimés. Le compte de déploiement
+          reste en place — c'est par lui que le playbook s'exécute, le retirer couperait la
+          connexion en cours ; le supprimer à la main si la machine quitte le parc." }}

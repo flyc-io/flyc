@@ -1,0 +1,10 @@
+# {{ ansible_managed }}
+# VIP anycast portées sur lo ; BIRD les annonce en BGP.
+network:
+  version: 2
+  ethernets:
+    lo:
+      addresses:
+{% for vip in flyc_lo_vips %}
+        - {{ vip }}/{{ '128' if ':' in vip else '32' }}
+{% endfor %}

@@ -1,0 +1,57 @@
+---
+- name: Secrets partagés (mot de passe Dataplane API)
+  ansible.builtin.set_fact:
+    flyc_secrets: "{{ hostvars[groups['data'][0]].flyc_secrets }}"
+  no_log: true
+
+- name: Paquet dataplaneapi {{ dataplane_version }}
+  ansible.builtin.apt:
+    lock_timeout: 600   # apt peut être tenu par unattended-upgrades sur une machine fraîche
+    deb: "{{ dataplane_deb_url }}"
+  register: dataplane_pkg
+
+- name: Répertoires de travail
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    owner: haproxy
+    group: haproxy
+    mode: "0750"
+  loop:
+    - /var/lib/dataplaneapi
+    - /var/lib/dataplaneapi/transactions
+    - /var/lib/dataplaneapi/backups
+
+- name: Configuration
+  ansible.builtin.template:
+    src: dataplaneapi.yml.j2
+    dest: /etc/dataplaneapi/dataplaneapi.yml
+    owner: root
+    group: root
+    mode: "0644"   # le service réécrit ce fichier en root:root 0644 au démarrage ; aucun secret dedans
+  notify: restart dataplaneapi
+
+- name: Options du service (chemin de config)
+  ansible.builtin.copy:
+    dest: /etc/default/dataplaneapi
+    mode: "0644"
+    content: 'SYSD_OPTIONS="-f /etc/dataplaneapi/dataplaneapi.yml"'
+  notify: restart dataplaneapi
+
+- name: Service actif
+  ansible.builtin.service:
+    name: dataplaneapi
+    state: started
+    enabled: true
+
+- name: Dataplane API répond
+  ansible.builtin.uri:
+    url: "http://{{ mgmt_ip }}:{{ flyc_dataplane_port }}/v3/info"
+    user: "{{ dataplane_user }}"
+    password: "{{ flyc_secrets.DATAPLANE_PASSWORD }}"
+    force_basic_auth: true
+  register: dp_info
+  retries: 10
+  delay: 2
+  until: dp_info.status == 200
+  changed_when: false

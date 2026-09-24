@@ -1,0 +1,14 @@
+# Généré par Ansible (edge/roles/flyc_compose/templates/prometheus.yml.j2). Exemple all-in-one.
+global: { scrape_interval: 15s, evaluation_interval: 15s }
+rule_files: [alerts.yml]
+alerting:
+  alertmanagers: [{ static_configs: [{ targets: ["alertmanager:9093"] }] }]
+scrape_configs:
+  - job_name: haproxy
+    static_configs: [{ targets: ["127.0.0.1:8404"] }]
+  - job_name: flyc-queue
+    static_configs: [{ targets: ["127.0.0.1:8080"] }]
+  - job_name: flyc-control
+    static_configs: [{ targets: ["flyc-control:8090"] }]
+  - job_name: node
+    static_configs: [{ targets: ["127.0.0.1:9100"] }]

@@ -1,0 +1,55 @@
+# Tests à chaque poussée et à chaque proposition de modification.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  go:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - run: go vet ./...
+      - run: go test ./...
+
+  ansible:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: pip install --quiet ansible-core ansible-lint yamllint
+      - run: ansible-galaxy collection install -r edge/requirements.yml -p .collections
+      - run: yamllint -d relaxed edge inventory deploy
+      - name: Syntaxe du playbook
+        env:
+          ANSIBLE_COLLECTIONS_PATH: .collections
+        run: ansible-playbook -i tools/fixtures/inventory.yml edge/site.yml --syntax-check
+
+  haproxy:
+    # La configuration HAProxy est rendue par Ansible puis validée par HAProxy lui-même : c'est le
+    # seul moyen de savoir qu'un template tient debout avant de le poser sur un LB.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update -qq && sudo apt-get install -y -qq haproxy openssl
+      - run: pip install --quiet ansible-core
+      - run: ansible-galaxy collection install -r edge/requirements.yml -p .collections
+      - env:
+          ANSIBLE_COLLECTIONS_PATH: .collections
+        run: |
+          ansible-playbook -i tools/fixtures/inventory.yml tools/render-edge.yml
+          ansible-playbook -i tools/fixtures/inventory-all-in-one.yml tools/render-edge.yml \
+            -e render_edge_host=box -e render_queue_host=box -e build_dir="$PWD/build/edge-aio"
+          haproxy -c -f build/edge/haproxy.cfg
+          haproxy -c -f build/edge-aio/haproxy.cfg
+
+  scripts:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Syntaxe des scripts
+        run: for f in tools/*.sh; do bash -n "$f"; done

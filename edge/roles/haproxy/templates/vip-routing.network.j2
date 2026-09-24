@@ -1,0 +1,27 @@
+# {{ ansible_managed }}
+# Le trafic sourcé par les VIP repart vers l'équipement BGP ; le trafic propre de l'hôte garde sa route par défaut.
+{% set vips = [flyc_vip_app, flyc_vip_wait] | unique %}
+{% if flyc_vip_gateway.v4 | default('') %}
+{% for vip in vips if vip.v4 %}
+[RoutingPolicyRule]
+From = {{ vip.v4 }}/32
+Table = {{ flyc_vip_route_table }}
+
+{% endfor %}
+[Route]
+Gateway = {{ flyc_vip_gateway.v4 }}
+Table = {{ flyc_vip_route_table }}
+
+{% endif %}
+{% if flyc_vip_gateway.v6 | default('') %}
+{% for vip in vips if vip.v6 %}
+[RoutingPolicyRule]
+From = {{ vip.v6 }}/128
+Table = {{ flyc_vip_route_table }}
+
+{% endfor %}
+[Route]
+Gateway = {{ flyc_vip_gateway.v6 }}
+Table = {{ flyc_vip_route_table }}
+
+{% endif %}

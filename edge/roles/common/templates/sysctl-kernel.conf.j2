@@ -1,0 +1,10 @@
+# {{ ansible_managed }}
+# Réglages noyau : posés seulement hors conteneur, sinon c'est l'hôte qui les porte.
+{% if 'edge' in group_names %}
+net.core.rmem_max = 16777216
+net.core.wmem_max = 16777216
+net.netfilter.nf_conntrack_max = 1048576
+{% endif %}
+{% if 'queue' in group_names or 'data' in group_names %}
+vm.overcommit_memory = 1
+{% endif %}

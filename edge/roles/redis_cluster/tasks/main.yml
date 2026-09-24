@@ -1,0 +1,206 @@
+---
+# Création du cluster au premier run, puis rattachement des nœuds ajoutés ensuite (nouvel hôte queue).
+# Tout passe par redis-cli depuis un conteneur du play ; les commandes visent explicitement un nœud
+# déjà membre, jamais « localhost », pour rester correct quand le play est limité au nouvel hôte.
+- name: Secrets partagés
+  ansible.builtin.set_fact:
+    flyc_secrets: "{{ hostvars[groups['data'][0]].flyc_secrets }}"
+  no_log: true
+
+- name: Liste des nœuds attendus
+  ansible.builtin.set_fact:
+    redis_nodes: "{{ groups['queue'] | map('extract', hostvars, 'mgmt_ip') | product(flyc_redis_node_ports) | map('join', ':') | list }}"
+
+- name: Attente des nœuds Redis
+  check_mode: false
+  ansible.builtin.command: >
+    docker exec flyc-redis-a redis-cli -a {{ flyc_secrets.REDIS_PASSWORD }} --no-auth-warning
+    -h {{ item.split(':')[0] }} -p {{ item.split(':')[1] }} ping
+  loop: "{{ redis_nodes }}"
+  register: ping
+  retries: 20
+  delay: 3
+  until: ping.stdout == 'PONG'
+  changed_when: false
+  run_once: true
+  no_log: true
+
+- name: État de chaque nœud
+  check_mode: false
+  ansible.builtin.command: >
+    docker exec flyc-redis-a redis-cli -a {{ flyc_secrets.REDIS_PASSWORD }} --no-auth-warning
+    -h {{ item.split(':')[0] }} -p {{ item.split(':')[1] }} cluster info
+  loop: "{{ redis_nodes }}"
+  register: node_state
+  changed_when: false
+  run_once: true
+  no_log: true
+
+# Un nœud déjà en service répond cluster_state:ok ; un nœud neuf répond fail avec un seul nœud connu.
+- name: Membres actuels et nœuds à rattacher
+  ansible.builtin.set_fact:
+    redis_members: "{{ node_state.results | selectattr('stdout', 'search', 'cluster_state:ok') | map(attribute='item') | list }}"
+    redis_absents: "{{ node_state.results | rejectattr('stdout', 'search', 'cluster_state:ok') | map(attribute='item') | list }}"
+  run_once: true
+
+- name: "Création du cluster (premier run : 3 maîtres + 3 répliques répartis sur les hôtes)"
+  ansible.builtin.command: >
+    docker exec flyc-redis-a redis-cli -a {{ flyc_secrets.REDIS_PASSWORD }} --no-auth-warning
+    --cluster create {{ redis_nodes | join(' ') }} --cluster-replicas 1 --cluster-yes
+  when: redis_members | length == 0
+  run_once: true
+  no_log: true
+
+# ---- Rattachement d'un hôte ajouté après coup -------------------------------------------------
+# Premier port de l'hôte : nouveau maître, il reçoit des slots par rééquilibrage.
+# Second port : réplique d'un maître situé sur un AUTRE hôte (sinon la perte de l'hôte emporte les deux).
+# Le nouveau maître se retrouve temporairement sans réplique : Redis en migre une automatiquement
+# depuis un maître qui en a deux (migration de réplique, cluster-migration-barrier par défaut).
+- name: Point d'entrée dans le cluster existant
+  ansible.builtin.set_fact:
+    redis_entry: "{{ redis_members[0] }}"
+  when: redis_members | length > 0 and redis_absents | length > 0
+  run_once: true
+
+- name: Nouveaux maîtres et nouvelles répliques
+  ansible.builtin.set_fact:
+    redis_new_masters: "{{ redis_absents | select('search', ':' ~ flyc_redis_node_ports[0] ~ '$') | list }}"
+    redis_new_replicas: "{{ redis_absents | reject('search', ':' ~ flyc_redis_node_ports[0] ~ '$') | list }}"
+  when: redis_members | length > 0 and redis_absents | length > 0
+  run_once: true
+
+- name: Rattachement des nouveaux maîtres
+  ansible.builtin.command: >
+    docker exec flyc-redis-a redis-cli -a {{ flyc_secrets.REDIS_PASSWORD }} --no-auth-warning
+    --cluster add-node {{ item }} {{ redis_entry }} --cluster-yes
+  loop: "{{ redis_new_masters | default([]) }}"
+  run_once: true
+  no_log: true
+
+# Le rééquilibrage déplace des slots entre nœuds : il échoue si un nœud ignore encore le nouveau
+# maître. On attend que le ragot ait convergé sur tous les nœuds avant de le lancer.
+- name: Convergence du cluster après rattachement
+  check_mode: false
+  ansible.builtin.command: >
+    docker exec flyc-redis-a redis-cli -a {{ flyc_secrets.REDIS_PASSWORD }} --no-auth-warning
+    -h {{ item.split(':')[0] }} -p {{ item.split(':')[1] }} cluster nodes
+  loop: "{{ redis_members }}"
+  register: gossip
+  retries: 20
+  delay: 3
+  until: redis_new_masters | default([]) | reject('in', gossip.stdout) | list | length == 0
+  changed_when: false
+  when: redis_new_masters | default([]) | length > 0
+  run_once: true
+  no_log: true
+
+# Un rééquilibrage interrompu laisse des slots « ouverts » (migrating/importing) et bloque les
+# suivants. --cluster fix est le remède documenté ; on ne l'applique que si le cas se présente.
+- name: Slots ouverts après un rééquilibrage interrompu ?
+  check_mode: false
+  ansible.builtin.command: >
+    docker exec flyc-redis-a redis-cli -a {{ flyc_secrets.REDIS_PASSWORD }} --no-auth-warning
+    --cluster check {{ redis_entry }}
+  register: cluster_check
+  changed_when: false
+  failed_when: false
+  when: redis_new_masters | default([]) | length > 0
+  run_once: true
+  no_log: true
+
+- name: Réparation des slots ouverts
+  ansible.builtin.command: >
+    docker exec flyc-redis-a redis-cli -a {{ flyc_secrets.REDIS_PASSWORD }} --no-auth-warning
+    --cluster fix {{ redis_entry }}
+  when: redis_new_masters | default([]) | length > 0 and 'open slots' in (cluster_check.stdout | default('') | lower)
+  run_once: true
+  no_log: true
+
+- name: Répartition des slots vers les nouveaux maîtres
+  ansible.builtin.command: >
+    docker exec flyc-redis-a redis-cli -a {{ flyc_secrets.REDIS_PASSWORD }} --no-auth-warning
+    --cluster rebalance {{ redis_entry }} --cluster-use-empty-masters --cluster-yes
+  register: rebalance
+  retries: 5
+  delay: 10
+  until: rebalance.rc == 0
+  when: redis_new_masters | default([]) | length > 0
+  run_once: true
+  no_log: true
+
+- name: Rattachement des nouvelles répliques
+  # Le maître retenu ici importe peu : la tâche de placement ci-dessous réaffecte l'ensemble.
+  ansible.builtin.command: >
+    docker exec flyc-redis-a redis-cli -a {{ flyc_secrets.REDIS_PASSWORD }} --no-auth-warning
+    --cluster add-node {{ item }} {{ redis_entry }} --cluster-slave
+  loop: "{{ redis_new_replicas | default([]) }}"
+  run_once: true
+  no_log: true
+
+
+# Topologie : un maître par hôte, chaque réplique sur une autre machine que son maître. Rejoué à
+# chaque run, sans effet quand tout est déjà en place ; répare aussi ce qu'une panne a laissé
+# (machine revenue en simple réplique) et ce que la migration automatique de Redis a défait.
+- name: Script de topologie Redis
+  ansible.builtin.copy:
+    src: redis-topology.py
+    dest: "{{ flyc_install_dir }}/redis-topology.py"
+    mode: "0750"
+    owner: root
+    group: flyc
+  run_once: true
+
+- name: Topologie Redis remise en forme (maîtres répartis, répliques ailleurs)
+  ansible.builtin.command: "{{ flyc_install_dir }}/redis-topology.py balance {{ redis_members[0] | default(redis_nodes[0]) }}"
+  register: place_replicas
+  changed_when: "'bascule(s)' in place_replicas.stdout or 'déplacement(s)' in place_replicas.stdout"
+  run_once: true
+
+- name: Résultat
+  ansible.builtin.debug:
+    msg: "{{ place_replicas.stdout_lines }}"
+  run_once: true
+
+# ---- Vérifications ----------------------------------------------------------------------------
+- name: Cluster en état ok
+  check_mode: false
+  ansible.builtin.command: >
+    docker exec flyc-redis-a redis-cli -a {{ flyc_secrets.REDIS_PASSWORD }} --no-auth-warning
+    -p {{ flyc_redis_node_ports[0] }} cluster info
+  register: cluster_final
+  retries: 10
+  delay: 3
+  until: "'cluster_state:ok' in cluster_final.stdout"
+  changed_when: false
+  run_once: true
+  no_log: true
+
+- name: Tous les nœuds attendus sont membres
+  check_mode: false
+  ansible.builtin.command: >
+    docker exec flyc-redis-a redis-cli -a {{ flyc_secrets.REDIS_PASSWORD }} --no-auth-warning
+    -p {{ flyc_redis_node_ports[0] }} cluster nodes
+  register: cluster_nodes_final
+  retries: 10
+  delay: 3
+  until: "redis_nodes | reject('in', cluster_nodes_final.stdout) | list | length == 0"
+  changed_when: false
+  run_once: true
+  no_log: true
+
+- name: flyc-queue voit le cluster (200 sur /healthz)
+  ansible.builtin.uri:
+    url: "http://127.0.0.1:{{ flyc_queue_port }}/healthz"
+    status_code: 200
+  register: queue_ok
+  retries: 20
+  delay: 3
+  until: queue_ok.status == 200
+
+- name: Résumé
+  ansible.builtin.debug:
+    msg: >-
+      Redis Cluster ok sur {{ redis_nodes | length }} nœuds ({{ groups['queue'] | length }} hôtes){{
+      ', ' ~ redis_absents | length ~ ' rattaché(s) à ce run' if (redis_members | length > 0 and redis_absents | length > 0) else '' }},
+      flyc-queue sain
+  run_once: true

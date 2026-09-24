@@ -1,0 +1,26 @@
+# Inventaire fixture all-in-one : une machine porte edge, queue et data ; la VIP est son IP.
+all:
+  vars:
+    flyc_env: fixture-aio
+    flyc_wait_host: wait-test.example.com
+    flyc_control_host: control-test.example.com
+    flyc_vip_app:  { v4: "192.0.2.40", v6: "" }
+    flyc_vip_wait: { v4: "192.0.2.40", v6: "" }
+    flyc_bgp: { enabled: false }
+    flyc_image_queue: example/flyc-queue:dev
+    flyc_image_control: example/flyc-control:dev
+    flyc_secrets: { DATAPLANE_PASSWORD: fixture, REDIS_PASSWORD: fixture, INTERNAL_TOKEN: fixture, POSTGRES_PASSWORD: fixture, FLYC_MASTER_KEY: fixture }
+    host_addresses: ["192.0.2.40"]
+  children:
+    edge:
+      hosts:
+        box: { mgmt_ip: "192.0.2.40", mgmt_ip6: "" }
+    queue:
+      hosts:
+        box:
+    data:
+      hosts:
+        box:
+    # Nœuds en cours de retrait : exclus des plays d'installation par edge/site.yml.
+    draining:
+      hosts: {}

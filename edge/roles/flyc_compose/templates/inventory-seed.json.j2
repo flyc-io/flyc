@@ -1,0 +1,58 @@
+{# Inventaire transmis à flyc-control pour amorcer sa base au tout premier démarrage. Ensuite la
+   base fait foi : ce fichier n'est plus qu'un point de comparaison, et un écart est signalé dans
+   le journal de control sans jamais être appliqué — sinon un nœud retiré depuis l'interface
+   réapparaîtrait au premier redéploiement lancé depuis un poste.
+
+   Fichier séparé et non variable du .env : le parseur dotenv de docker compose ne survit pas à une
+   valeur JSON, il perd toutes les variables suivantes (dont FLYC_MASTER_KEY).
+
+   Un réglage optionnel ajouté à l'inventaire doit être repris dans extra_vars ci-dessous pour être
+   transmis — ou saisi directement dans l'interface. #}
+{# Une machine peut porter plusieurs rôles (profil all-in-one) : une entrée par machine, pas par groupe. #}
+{% set seed_roles = {} %}
+{% for role in ['edge', 'queue', 'data'] %}
+{% for h in groups[role] | default([]) %}
+{% set _ = seed_roles.update({h: seed_roles.get(h, []) + [role]}) %}
+{% endfor %}
+{% endfor %}
+{% set seed_nodes = [] %}
+{% for h, roles in seed_roles.items() %}
+{% set _ = seed_nodes.append({'name': h, 'roles': roles, 'mgmt_ip': hostvars[h].mgmt_ip, 'mgmt_ip6': hostvars[h].mgmt_ip6 | default(''), 'state': 'ready'}) %}
+{% endfor %}
+{# Certificat du registre : le contenu d'abord (inventaire généré par control), le chemin ensuite
+   (mode poste). Ne regarder que le chemin viderait le certificat dès qu'un déploiement est rejoué
+   depuis l'inventaire généré, où seul le contenu existe. #}
+{% set extra = {} %}
+{% if haproxy_ticket_rate_limit is defined %}{% set _ = extra.update({'haproxy_ticket_rate_limit': haproxy_ticket_rate_limit}) %}{% endif %}
+{{ {
+  'settings': {
+    'env': flyc_env,
+    'ansible_user': 'flyc-deploy',
+    'wait_host': flyc_wait_host,
+    'control_host': flyc_control_host,
+    'vip_app_v4': flyc_vip_app.v4 | default(''),
+    'vip_app_v6': flyc_vip_app.v6 | default(''),
+    'vip_wait_v4': flyc_vip_wait.v4 | default(''),
+    'vip_wait_v6': flyc_vip_wait.v6 | default(''),
+    'vip_gateway_v4': flyc_vip_gateway.v4 | default(''),
+    'vip_gateway_v6': flyc_vip_gateway.v6 | default(''),
+    'bgp_enabled': flyc_bgp.enabled | default(true) | bool,
+    'bgp_local_as': flyc_bgp.local_as | default(0) | int,
+    'bgp_neighbors': flyc_bgp.neighbors | default([]),
+    'acme_email': flyc_acme_email | default(''),
+    'acme_directory': flyc_acme_directory | default(''),
+    'control_public_url': flyc_control_public_url | default('https://' ~ flyc_control_host),
+    'cookie_secure': flyc_cookie_secure | default(true) | bool,
+    'image_tag': flyc_image_tag,
+    'registry': flyc_image_queue | regex_replace('/flyc-queue:.*$', ''),
+    'queue_port': flyc_queue_port | int,
+    'control_port': flyc_control_port | int,
+    'dataplane_port': flyc_dataplane_port | int,
+    'manage_firewall': flyc_manage_firewall | default(true) | bool,
+    'deploy_from': flyc_deploy_from | default(''),
+    'registry_ca': (flyc_registry_ca if (flyc_registry_ca | default('') | length > 0)
+                    else (lookup('file', flyc_registry_ca_file) if (flyc_registry_ca_file | default('') | length > 0) else '')) | trim,
+    'extra_vars': extra,
+  },
+  'nodes': seed_nodes,
+} | to_nice_json }}

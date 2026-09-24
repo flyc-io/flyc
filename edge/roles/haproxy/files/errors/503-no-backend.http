@@ -1,0 +1,9 @@
+HTTP/1.1 503 Service Unavailable
+Cache-Control: no-cache
+Content-Type: text/html; charset=utf-8
+
+<!doctype html><html lang="fr"><head><meta charset="utf-8"><title>Site indisponible</title></head>
+<body style="font-family:system-ui;margin:10vh auto;max-width:36rem;text-align:center;color:#1a222b">
+<h1>Site momentanément indisponible</h1>
+<p>Aucun serveur n'est disponible pour ce domaine. Réessayez dans quelques instants.</p>
+</body></html>

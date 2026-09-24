@@ -1,0 +1,42 @@
+---
+- name: haproxy -c
+  check_mode: false
+  ansible.builtin.command: haproxy -c -f {{ haproxy_etc }}/haproxy.cfg
+  changed_when: false
+
+- name: Sessions BGP établies
+  check_mode: false
+  ansible.builtin.shell: birdc show protocols | awk '$2=="BGP"{print $1, $6}'
+  register: bgp_state
+  retries: 12
+  delay: 5
+  until: bgp_state.stdout_lines | length > 0 and (bgp_state.stdout_lines | reject('search', 'Established') | list | length == 0)
+  changed_when: false
+  when: flyc_bgp.enabled | default(true)
+
+- name: VIP wait répond en HTTPS (cert bootstrap accepté)
+  ansible.builtin.uri:
+    url: "https://{{ flyc_vip_wait.v4 }}/healthz"
+    headers: { Host: "{{ flyc_wait_host }}" }
+    validate_certs: false
+    status_code: 200
+  retries: 5
+  delay: 2
+  register: wait_ok
+  until: wait_ok.status == 200
+
+- name: VIP wait répond en HTTPS sur IPv6
+  ansible.builtin.uri:
+    url: "https://[{{ flyc_vip_wait.v6 }}]/healthz"
+    headers: { Host: "{{ flyc_wait_host }}" }
+    validate_certs: false
+    status_code: 200
+  retries: 5
+  delay: 2
+  register: wait6_ok
+  until: wait6_ok.status == 200
+  when: flyc_vip_wait.v6 | default('') | length > 0
+
+- name: Résumé
+  ansible.builtin.debug:
+    msg: "{{ inventory_hostname }} : haproxy ok, BGP {{ bgp_state.stdout_lines | default(['désactivé']) | join(' / ') }}, VIP wait ok en v4{{ ' et v6' if (flyc_vip_wait.v6 | default('') | length > 0) else '' }}"

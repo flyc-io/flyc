@@ -1,0 +1,32 @@
+# Inventaire fixture : rendu local des templates (make check-haproxy), aucune connexion.
+all:
+  vars:
+    flyc_env: fixture
+    flyc_wait_host: wait-test.example.com
+    flyc_control_host: control-test.example.com
+    flyc_vip_app:  { v4: "192.0.2.10", v6: "2001:db8::10" }
+    flyc_vip_wait: { v4: "192.0.2.11", v6: "2001:db8::11" }
+    flyc_bgp:
+      local_as: 64512
+      neighbors:
+        - { ip: "192.0.2.1", remote_as: 65000, family: v4 }
+        - { ip: "2001:db8::1", remote_as: 65000, family: v6 }
+    flyc_image_queue: example/flyc-queue:dev
+    flyc_image_control: example/flyc-control:dev
+    flyc_secrets: { DATAPLANE_PASSWORD: fixture, REDIS_PASSWORD: fixture, INTERNAL_TOKEN: fixture, POSTGRES_PASSWORD: fixture, FLYC_MASTER_KEY: fixture }
+  children:
+    edge:
+      hosts:
+        lbt0: { mgmt_ip: "192.0.2.20", mgmt_ip6: "2001:db8::20" }
+        lbt1: { mgmt_ip: "192.0.2.21", mgmt_ip6: "2001:db8::21" }
+    queue:
+      hosts:
+        qt0: { mgmt_ip: "192.0.2.30" }
+        qt1: { mgmt_ip: "192.0.2.31" }
+        qt2: { mgmt_ip: "192.0.2.32" }
+    data:
+      hosts:
+        qt0:
+    # Nœuds en cours de retrait : exclus des plays d'installation par edge/site.yml.
+    draining:
+      hosts: {}

@@ -1,0 +1,16 @@
+# {{ ansible_managed }}
+# Réglages de l'espace de noms réseau : applicables y compris en conteneur.
+{% if 'edge' in group_names %}
+net.core.somaxconn = 65535
+net.ipv4.tcp_max_syn_backlog = 65535
+net.ipv4.ip_local_port_range = 10000 65535
+net.ipv4.tcp_tw_reuse = 1
+# Les VIP sont portées sur lo mais HAProxy écoute dessus avant qu'elles n'existent
+net.ipv4.ip_nonlocal_bind = 1
+net.ipv6.ip_nonlocal_bind = 1
+net.ipv4.ip_forward = 0
+{% endif %}
+{% if 'queue' in group_names or 'data' in group_names %}
+net.core.somaxconn = 65535
+net.ipv4.ip_local_port_range = 10000 65535
+{% endif %}

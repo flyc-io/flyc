@@ -1,0 +1,47 @@
+# Publication d'une version : git tag v1.2.3 && git push origin v1.2.3
+#
+# Les trois images partent vers ghcr.io sous la version exacte, la série mineure (v1.2 suit les
+# correctifs) et latest — qui désigne donc toujours une version publiée, jamais la pointe de main.
+# Aucun secret à configurer : GITHUB_TOKEN suffit à publier dans le registre de l'organisation.
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  images:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        image: [queue, control, runner]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository_owner }}/flyc-${{ matrix.image }}
+          tags: |
+            type=raw,value=${{ github.ref_name }}
+            type=semver,pattern=v{{major}}.{{minor}}
+            type=raw,value=latest
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ${{ matrix.image }}/Dockerfile
+          push: true
+          build-args: VERSION=${{ github.ref_name }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}

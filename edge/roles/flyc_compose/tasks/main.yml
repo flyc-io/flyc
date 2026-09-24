@@ -1,0 +1,224 @@
+---
+- name: Secrets partagés depuis l'hôte data
+  ansible.builtin.set_fact:
+    flyc_secrets: "{{ hostvars[groups['data'][0]].flyc_secrets }}"
+  no_log: true
+
+# Aucun secret dans ces fichiers (ils sont dans .env et secrets.env, en 0640) : lisibles par tous,
+# les conteneurs de supervision tournent sous leurs propres uid. prometheus.yml et alertmanager.yml
+# sont rendus plus bas depuis l'inventaire (les .example du dépôt servent au lancement sans Ansible).
+- name: Fichiers compose
+  ansible.builtin.copy:
+    src: "{{ playbook_dir }}/../deploy/compose/"
+    dest: "{{ flyc_install_dir }}/"
+    owner: root
+    group: flyc
+    mode: "0644"
+    directory_mode: "0755"
+
+- name: .env du compose
+  ansible.builtin.template:
+    src: env.j2
+    dest: "{{ flyc_install_dir }}/.env"
+    owner: root
+    group: flyc
+    mode: "0640"
+  no_log: true
+
+# Lu une seule fois par flyc-control, au premier démarrage, pour amorcer nodes et platform_settings.
+# Lisible par tous : aucun secret ici (noms d'hôtes, adresses, certificat racine public), et le
+# conteneur flyc-control tourne sous son propre uid, sans rapport avec le groupe flyc de l'hôte.
+- name: Inventaire d'amorçage de flyc-control
+  ansible.builtin.template:
+    src: inventory-seed.json.j2
+    dest: "{{ flyc_install_dir }}/inventory-seed.json"
+    owner: root
+    group: flyc
+    mode: "0644"
+  when: "'data' in group_names or (flyc_all_in_one | bool)"
+
+- name: prometheus.yml (cibles depuis l'inventaire)
+  register: prometheus_cfg
+  ansible.builtin.template:
+    src: prometheus.yml.j2
+    dest: "{{ flyc_install_dir }}/monitoring/prometheus/prometheus.yml"
+    owner: root
+    group: flyc
+    mode: "0644"
+  when: "'data' in group_names"
+
+- name: alertmanager.yml (récepteur depuis l'inventaire)
+  register: alertmanager_cfg
+  ansible.builtin.template:
+    src: alertmanager.yml.j2
+    dest: "{{ flyc_install_dir }}/monitoring/alertmanager/alertmanager.yml"
+    owner: root
+    group: flyc
+    mode: "0644"
+  when: "'data' in group_names"
+
+# Chaque volume appartient à l'uid sous lequel tourne son conteneur (postgres:17-alpine = 70,
+# redis:7-alpine = 999, flyc-control = 10001). Les rechmoder en root couperait l'accès au service.
+- name: "Volumes monitoring (uid des images : prometheus 65534, grafana 472)"
+  ansible.builtin.file:
+    path: "{{ flyc_data_dir }}/{{ item.name }}"
+    state: directory
+    owner: "{{ item.uid }}"
+    group: "{{ item.uid }}"
+    mode: "0750"
+  loop:
+    - { name: prometheus, uid: "65534" }
+    - { name: alertmanager, uid: "65534" }
+    - { name: grafana, uid: "472" }
+  when: "'data' in group_names"
+
+- name: Volumes Redis
+  ansible.builtin.file:
+    path: "{{ flyc_data_dir }}/{{ item }}"
+    state: directory
+    owner: "999"
+    group: "999"
+    mode: "0750"
+  loop: [redis-a, redis-b, redis-c, redis-d, redis-e, redis-f]
+
+- name: Volume Postgres
+  ansible.builtin.file:
+    path: "{{ flyc_data_dir }}/postgres"
+    state: directory
+    owner: "70"
+    group: "70"
+    mode: "0700"
+
+# Répertoire d'échange entre control (UID 10001) et le runner (root) : les deux doivent y écrire,
+# personne d'autre n'a à le lire.
+- name: Volumes des tâches
+  ansible.builtin.file:
+    path: "{{ flyc_data_dir }}/{{ item.name }}"
+    state: directory
+    owner: root
+    group: "10001"
+    mode: "{{ item.mode }}"
+  loop:
+    - { name: jobs, mode: "0770" }
+    - { name: runner, mode: "0700" }
+  when: "'data' in group_names"
+
+- name: Volume flyc-control
+  ansible.builtin.file:
+    path: "{{ flyc_data_dir }}/control"
+    state: directory
+    owner: "10001"
+    group: "10001"
+    mode: "0750"
+
+# Les images sont épinglées par tag (flyc_image_tag) : compose ne télécharge que ce qui manque.
+# Avec un tag mouvant comme "latest", -e flyc_pull_images=true force le re-téléchargement.
+- name: Re-téléchargement forcé des images (flyc_pull_images)
+  community.docker.docker_compose_v2_pull:
+    project_src: "{{ flyc_install_dir }}"
+    profiles: "{{ flyc_compose_profiles }}"
+    policy: always
+  when: flyc_pull_images | bool
+
+# flyc-runner est écarté du « compose up » : c'est lui qui exécute ce playbook quand l'ordre vient
+# de l'interface, et le recréer ici tuerait la tâche en cours. Son remplacement est différé à un
+# service systemd, qui survit au conteneur (voir runner-refresh.sh).
+- name: Services déclarés par le compose
+  ansible.builtin.command:
+    cmd: docker compose {{ flyc_profile_args }} config --services
+    chdir: "{{ flyc_install_dir }}"
+  register: compose_services
+  changed_when: false
+
+- name: Compose up ({{ flyc_compose_profiles | join(', ') }})
+  community.docker.docker_compose_v2:
+    project_src: "{{ flyc_install_dir }}"
+    profiles: "{{ flyc_compose_profiles }}"
+    services: "{{ compose_services.stdout_lines | reject('equalto', 'flyc-runner') | list }}"
+    state: present
+    pull: missing
+    remove_orphans: true
+  register: compose_result
+
+- name: Script de remplacement du conteneur des tâches
+  ansible.builtin.template:
+    src: runner-refresh.sh.j2
+    dest: "{{ flyc_install_dir }}/runner-refresh.sh"
+    owner: root
+    group: root
+    mode: "0750"
+  when: "'flyc-runner' in compose_services.stdout_lines"
+
+# Le runner étant hors du « compose up », rien ne téléchargerait son image : la sonde ci-dessous,
+# qui simule le up, échouerait sur une image absente.
+- name: Image de l'exécuteur de tâches
+  community.docker.docker_compose_v2_pull:
+    project_src: "{{ flyc_install_dir }}"
+    profiles: "{{ flyc_compose_profiles }}"
+    services: [flyc-runner]
+    policy: "{{ 'always' if (flyc_pull_images | bool) else 'missing' }}"
+  when: "'flyc-runner' in compose_services.stdout_lines"
+
+- name: Le conteneur des tâches est-il à jour ?
+  ansible.builtin.command:
+    cmd: docker compose {{ flyc_profile_args }} up -d --dry-run flyc-runner
+    chdir: "{{ flyc_install_dir }}"
+  register: runner_etat
+  changed_when: false
+  when: "'flyc-runner' in compose_services.stdout_lines"
+
+# Nom d'unité horodaté : deux remplacements peuvent se chevaucher si une tâche est longue, et un
+# nom fixe ferait échouer le second au lieu de le laisser attendre son tour.
+- name: Remplacement différé du conteneur des tâches
+  ansible.builtin.command:
+    cmd: >-
+      systemd-run --unit=flyc-runner-refresh-{{ ansible_facts.date_time.epoch }} --collect
+      --description=Flyc-remplacement-du-conteneur-des-taches
+      {{ flyc_install_dir }}/runner-refresh.sh
+  when:
+    - "'flyc-runner' in compose_services.stdout_lines"
+    - ((runner_etat.stdout | default('')) ~ (runner_etat.stderr | default(''))) is search('Recreate|Creating|Created|Starting|Started')
+
+# Un changement de cibles (nœud ajouté ou retiré) ne prend effet qu'au rechargement : sans cela
+# Prometheus garde sa configuration de démarrage et ignore les nouveaux hôtes en silence.
+- name: Prometheus recharge sa configuration
+  ansible.builtin.uri:
+    url: "http://127.0.0.1:9090/-/reload"
+    method: POST
+    status_code: 200
+  retries: 10
+  delay: 3
+  register: prom_reload
+  until: prom_reload.status == 200
+  when: "'data' in group_names and (flyc_monitoring | default(true)) and prometheus_cfg.changed"
+
+- name: Alertmanager recharge sa configuration
+  ansible.builtin.uri:
+    url: "http://127.0.0.1:9093/-/reload"
+    method: POST
+    status_code: 200
+  retries: 10
+  delay: 3
+  register: am_reload
+  until: am_reload.status == 200
+  when: "'data' in group_names and (flyc_monitoring | default(true)) and alertmanager_cfg.changed"
+
+- name: flyc-queue répond
+  ansible.builtin.uri:
+    url: "http://127.0.0.1:{{ flyc_queue_port }}/healthz"
+    status_code: [200, 503]
+  register: queue_health
+  retries: 20
+  delay: 3
+  until: queue_health.status in [200, 503]
+  when: "'queue' in group_names"
+
+- name: flyc-control répond
+  ansible.builtin.uri:
+    url: "http://127.0.0.1:{{ flyc_control_port }}/healthz"
+    status_code: 200
+  register: control_health
+  retries: 30
+  delay: 3
+  until: control_health.status == 200
+  when: "'data' in group_names"

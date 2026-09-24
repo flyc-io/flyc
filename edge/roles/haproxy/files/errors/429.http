@@ -1,0 +1,6 @@
+HTTP/1.1 429 Too Many Requests
+Cache-Control: no-cache
+Retry-After: 10
+Content-Type: application/json
+
+{"error":"rate_limited","retry_after":10}

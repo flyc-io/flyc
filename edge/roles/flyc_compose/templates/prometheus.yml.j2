@@ -1,0 +1,24 @@
+# {{ ansible_managed }}
+global: { scrape_interval: 15s, evaluation_interval: 15s }
+rule_files: [alerts.yml]
+alerting:
+  alertmanagers: [{ static_configs: [{ targets: ["alertmanager:9093"] }] }]
+scrape_configs:
+  - job_name: haproxy
+    static_configs:
+{% for h in groups['edge'] %}
+      - { targets: ["{{ hostvars[h].mgmt_ip }}:{{ flyc_stats_port }}"], labels: { host: "{{ h }}" } }
+{% endfor %}
+  - job_name: flyc-queue
+    static_configs:
+{% for h in groups['queue'] %}
+      - { targets: ["{{ hostvars[h].mgmt_ip }}:{{ flyc_queue_port }}"], labels: { host: "{{ h }}" } }
+{% endfor %}
+  - job_name: flyc-control
+    static_configs:
+      - { targets: ["flyc-control:8090"], labels: { host: "{{ groups['data'][0] }}" } }
+  - job_name: node
+    static_configs:
+{% for h in (groups['edge'] + groups['queue'] + groups['data']) | unique %}
+      - { targets: ["{{ hostvars[h].mgmt_ip }}:9100"], labels: { host: "{{ h }}" } }
+{% endfor %}

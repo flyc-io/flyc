@@ -1,0 +1,8 @@
+---
+flyc_compose_profiles: >-
+  {{ (['all-in-one'] if (flyc_all_in_one | bool) else
+      (['queue'] if 'queue' in group_names else []) + (['data'] if 'data' in group_names else []))
+     + (['monitoring'] if ('data' in group_names and (flyc_monitoring | default(true))) else []) }}
+
+# Les mêmes profils, sous la forme attendue par la ligne de commande docker compose.
+flyc_profile_args: "{{ flyc_compose_profiles | map('regex_replace', '^', '--profile ') | join(' ') }}"

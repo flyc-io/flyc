@@ -1,0 +1,107 @@
+---
+- name: Dépendances
+  ansible.builtin.apt:
+    lock_timeout: 600   # apt peut être tenu par unattended-upgrades sur une machine fraîche
+    name: [ca-certificates, curl, gnupg]
+    state: present
+
+- name: Clé du dépôt Docker
+  ansible.builtin.get_url:
+    url: https://download.docker.com/linux/ubuntu/gpg
+    dest: /etc/apt/keyrings/docker.asc
+    mode: "0644"
+
+- name: Dépôt Docker
+  ansible.builtin.apt_repository:
+    repo: "deb [arch={{ 'amd64' if ansible_architecture == 'x86_64' else 'arm64' }} signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu {{ ansible_distribution_release }} stable"
+    filename: docker
+    state: present
+
+# Deux origines possibles : un fichier sur la machine qui joue Ansible (mode poste, tools/setup.sh)
+# ou le contenu porté par l'inventaire généré par control — control et le runner n'ont pas accès au
+# poste où le certificat a été téléchargé à l'origine.
+- name: CA du registre d'images (optionnel, registre avec CA privée)
+  when: (flyc_registry_ca | default('') | length > 0) or (flyc_registry_ca_file | default('') | length > 0)
+  block:
+    - name: Contenu de la CA du registre
+      ansible.builtin.set_fact:
+        flyc_registry_ca_pem: >-
+          {{ flyc_registry_ca if (flyc_registry_ca | default('') | length > 0)
+             else lookup('file', flyc_registry_ca_file) }}
+
+    - name: CA dans le magasin système
+      ansible.builtin.copy:
+        content: "{{ flyc_registry_ca_pem | trim }}\n"
+        dest: /usr/local/share/ca-certificates/flyc-registry-ca.crt
+        mode: "0644"
+      register: registry_ca
+
+    - name: update-ca-certificates
+      ansible.builtin.command: update-ca-certificates
+      when: registry_ca is changed
+
+    - name: Répertoire certs.d du registre
+      ansible.builtin.file:
+        path: "/etc/docker/certs.d/{{ flyc_image_queue | regex_replace('/.*$', '') }}"
+        state: directory
+        mode: "0755"
+
+    - name: CA lue par Docker sans redémarrage (/etc/docker/certs.d/<registre>/ca.crt)
+      ansible.builtin.copy:
+        content: "{{ flyc_registry_ca_pem | trim }}\n"
+        dest: "/etc/docker/certs.d/{{ flyc_registry_host }}/ca.crt"
+        mode: "0644"
+      vars:
+        flyc_registry_host: "{{ flyc_image_queue | regex_replace('/.*$', '') }}"
+
+- name: Paquets Docker
+  ansible.builtin.apt:
+    lock_timeout: 600   # apt peut être tenu par unattended-upgrades sur une machine fraîche
+    name: [docker-ce, docker-ce-cli, containerd.io, docker-buildx-plugin, docker-compose-plugin]
+    state: present
+    update_cache: true
+
+- name: Répertoire du drop-in systemd
+  ansible.builtin.file:
+    path: /etc/systemd/system/docker.service.d
+    state: directory
+    mode: "0755"
+
+- name: Limite de fichiers ouverts du daemon (les conteneurs ne peuvent pas dépasser la sienne)
+  ansible.builtin.copy:
+    dest: /etc/systemd/system/docker.service.d/limits.conf
+    mode: "0644"
+    content: |
+      [Service]
+      LimitNOFILE=1048576
+      LimitNPROC=infinity
+      TasksMax=infinity
+  notify: restart docker
+
+- name: daemon.json (rotation des logs, live-restore)
+  ansible.builtin.copy:
+    dest: /etc/docker/daemon.json
+    mode: "0644"
+    content: |
+      {
+        "log-driver": "json-file",
+        "log-opts": { "max-size": "50m", "max-file": "5" },
+        "live-restore": true
+      }
+  notify: restart docker
+
+- name: Docker actif (redémarré si la config du daemon a changé)
+  ansible.builtin.meta: flush_handlers
+
+- name: Docker actif
+  ansible.builtin.systemd:
+    name: docker
+    state: started
+    enabled: true
+    daemon_reload: true
+
+- name: Utilisateur flyc dans le groupe docker
+  ansible.builtin.user:
+    name: flyc
+    groups: docker
+    append: true

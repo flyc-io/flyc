@@ -1,0 +1,5 @@
+---
+- name: restart dataplaneapi
+  ansible.builtin.service:
+    name: dataplaneapi
+    state: restarted

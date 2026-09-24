@@ -1,0 +1,62 @@
+groups:
+  - name: flyc
+    rules:
+      - alert: FlycLoadBalancerDown
+        expr: up{job="haproxy"} == 0
+        for: 2m
+        labels: { severity: critical }
+        annotations: { summary: "LB {{ $labels.instance }} injoignable (HAProxy ne répond plus aux métriques)" }
+      - alert: FlycQueueHostDown
+        expr: up{job="flyc-queue"} == 0
+        for: 2m
+        labels: { severity: critical }
+        annotations: { summary: "flyc-queue {{ $labels.instance }} injoignable" }
+      - alert: FlycControlDown
+        expr: up{job="flyc-control"} == 0
+        for: 3m
+        labels: { severity: warning }
+        annotations: { summary: "flyc-control injoignable (les files continuent, l'administration est indisponible)" }
+      - alert: FlycEdgeOutOfSync
+        expr: flyc_control_edge_in_sync == 0
+        for: 5m
+        labels: { severity: warning }
+        annotations: { summary: "LB {{ $labels.edge }} pas synchronisé avec flyc-control depuis 5 min" }
+      - alert: FlycAdmitterMissing
+        expr: (sum by (room) (flyc_queue_pending) > 0) and (sum by (room) (flyc_queue_admitter_leader) == 0)
+        for: 30s
+        labels: { severity: critical }
+        annotations: { summary: "Aucun admitter pour la file {{ $labels.room }} alors que des visiteurs attendent" }
+      - alert: FlycCertificateExpiringSoon
+        expr: (flyc_control_certificate_expiry_seconds - time()) < 15 * 86400
+        for: 1h
+        labels: { severity: warning }
+        annotations: { summary: "Certificat de {{ $labels.fqdn }} expire dans moins de 15 jours" }
+      - alert: FlycCertificateError
+        expr: flyc_control_certificate_status{status="error"} == 1
+        for: 30m
+        labels: { severity: warning }
+        annotations: { summary: "Émission du certificat de {{ $labels.fqdn }} en échec depuis 30 min" }
+      - alert: FlycBackendServerDown
+        expr: haproxy_server_up{proxy=~"bk_.*__.*"} == 0
+        for: 2m
+        labels: { severity: warning }
+        annotations: { summary: "Serveur {{ $labels.server }} du backend {{ $labels.proxy }} vu DOWN par {{ $labels.instance }}" }
+      - alert: FlycDegradedMode
+        expr: increase(flyc_queue_degraded_total[5m]) > 0
+        labels: { severity: warning }
+        annotations: { summary: "Mode dégradé déclenché : un LB approche de son plafond de connexions" }
+      - alert: FlycSSEHigh
+        expr: sum(flyc_queue_sse_connections) > 200000
+        for: 2m
+        labels: { severity: warning }
+        annotations: { summary: "Plus de 200 000 flux SSE ouverts : approche de la capacité mémoire des hôtes queue" }
+      - alert: FlycHostMemoryHigh
+        expr: (1 - node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes) > 0.9
+        for: 5m
+        labels: { severity: warning }
+        annotations: { summary: "Mémoire > 90 % sur {{ $labels.instance }}" }
+      - alert: FlycRedisClusterDegraded
+        expr: flyc_queue_redis_ok == 0
+        for: 1m
+        labels: { severity: critical }
+        annotations: { summary: "Redis Cluster non ok vu par {{ $labels.instance }}" }

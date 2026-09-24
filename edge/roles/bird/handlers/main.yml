@@ -1,0 +1,4 @@
+---
+- name: reload bird
+  ansible.builtin.command: birdc configure
+  changed_when: true

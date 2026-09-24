@@ -1,0 +1,140 @@
+# Pipeline Flyc : test → build → deploy (manuel).
+#
+# Toutes les variables sont facultatives ; sans elles, le pipeline teste et construit sans rien
+# pousser ni déployer.
+#   GHCR_USER, GHCR_TOKEN                     registre public (jeton GitHub, write:packages)
+#   INTERNAL_REGISTRY, _USER, _PASSWORD       registre privé, pour pousser aussi chaque commit
+#   ANSIBLE_INVENTORY, ANSIBLE_SSH_KEY        déploiement automatique d'un environnement
+#
+# Publier une version :  git tag v1.2.3 && git push origin v1.2.3
+stages: [test, build, deploy]
+
+variables:
+  # Registre interne, facultatif : renseigner INTERNAL_REGISTRY (hôte/projet) dans les variables
+  # du projet pour pousser aussi chaque commit de main vers un registre privé. Vide = seules les
+  # versions publiées sont construites et poussées.
+  INTERNAL_REGISTRY: ""
+  INTERNAL_REGISTRY_INSECURE: "false"   # "true" si son certificat n'est pas dans le magasin du runner
+  # Registre public : seules les versions publiées (tag git vX.Y.Z) y vont. « latest » y désigne
+  # donc la dernière version, pas la pointe de main — c'est ce qu'installe un tiers.
+  PUBLIC_REGISTRY: ghcr.io/flyc-io
+  GO_VERSION: "1.27"
+  GOFLAGS: "-mod=mod"
+  GOPATH: "$CI_PROJECT_DIR/.go"
+
+default:
+  tags: [docker]
+
+cache:
+  key: go-mod
+  paths: [.go/pkg/mod]
+
+go-test:
+  stage: test
+  image: golang:${GO_VERSION}-alpine
+  script:
+    - apk add --no-cache git
+    - go vet ./...
+    - go test ./...
+
+ansible-lint:
+  stage: test
+  image: python:3.12-slim
+  script:
+    - pip install -q ansible-core ansible-lint yamllint
+    - ansible-galaxy collection install -r edge/requirements.yml -p .collections
+    - ANSIBLE_COLLECTIONS_PATH=.collections ansible-lint edge/site.yml || true   # informatif tant que les rôles bougent
+    - yamllint -d relaxed edge inventory deploy
+
+haproxy-check:
+  stage: test
+  image: python:3.12-slim
+  script:
+    - apt-get update -qq && apt-get install -y -qq --no-install-recommends haproxy openssl >/dev/null
+    - pip install -q ansible-core
+    - ansible-galaxy collection install -r edge/requirements.yml -p .collections
+    - ANSIBLE_COLLECTIONS_PATH=.collections ansible-playbook -i tools/fixtures/inventory.yml tools/render-edge.yml
+    - ANSIBLE_COLLECTIONS_PATH=.collections ansible-playbook -i tools/fixtures/inventory-all-in-one.yml tools/render-edge.yml -e render_edge_host=box -e render_queue_host=box -e build_dir=$CI_PROJECT_DIR/build/edge-aio
+    - haproxy -c -f build/edge/haproxy.cfg
+    - haproxy -c -f build/edge-aio/haproxy.cfg
+  artifacts:
+    paths: [build/edge]
+    expire_in: 1 week
+
+.build-image:
+  stage: build
+  image:
+    name: gcr.io/kaniko-project/executor:debug
+    entrypoint: [""]
+  script:
+    - VERSION=${CI_COMMIT_TAG:-${CI_COMMIT_SHORT_SHA}}
+    - mkdir -p /kaniko/.docker
+    # Deux destinations possibles, chacune facultative : un registre interne (chaque commit de
+    # main) et le registre public (seulement les versions publiées, sous trois étiquettes — la
+    # version exacte, la série mineure qui suit les correctifs, et latest).
+    - |
+      AUTHS=""; DESTS=""; OPTS=""
+      if [ -n "$INTERNAL_REGISTRY" ]; then
+        HOTE=${INTERNAL_REGISTRY%%/*}
+        AUTHS="\"$HOTE\":{\"username\":\"$INTERNAL_REGISTRY_USER\",\"password\":\"$INTERNAL_REGISTRY_PASSWORD\"}"
+        DESTS="--destination=$INTERNAL_REGISTRY/$IMAGE:$VERSION --destination=$INTERNAL_REGISTRY/$IMAGE:latest"
+        [ "$INTERNAL_REGISTRY_INSECURE" = "true" ] && OPTS="--skip-tls-verify-registry=$HOTE"
+      fi
+      if [ -n "$CI_COMMIT_TAG" ] && [ -n "$GHCR_TOKEN" ]; then
+        MINOR=$(echo "$CI_COMMIT_TAG" | cut -d. -f1,2)
+        [ -n "$AUTHS" ] && AUTHS="$AUTHS,"
+        AUTHS="$AUTHS\"ghcr.io\":{\"username\":\"$GHCR_USER\",\"password\":\"$GHCR_TOKEN\"}"
+        DESTS="$DESTS --destination=$PUBLIC_REGISTRY/$IMAGE:$CI_COMMIT_TAG"
+        DESTS="$DESTS --destination=$PUBLIC_REGISTRY/$IMAGE:$MINOR"
+        DESTS="$DESTS --destination=$PUBLIC_REGISTRY/$IMAGE:latest"
+      fi
+      if [ -z "$DESTS" ]; then
+        echo "aucun registre configuré : construction seule, rien ne sera poussé"
+        DESTS="--no-push"
+      fi
+      printf '{"auths":{%s}}' "$AUTHS" > /kaniko/.docker/config.json
+      echo "$DESTS" > /tmp/dests; echo "$OPTS" > /tmp/opts
+    - /kaniko/executor
+      --context=$CI_PROJECT_DIR
+      --dockerfile=$CI_PROJECT_DIR/$DOCKERFILE
+      --build-arg VERSION=$VERSION
+      --label org.opencontainers.image.version=$VERSION
+      --label org.opencontainers.image.revision=$CI_COMMIT_SHA
+      --label org.opencontainers.image.source=$CI_PROJECT_URL
+      $(cat /tmp/opts) $(cat /tmp/dests)
+      --cache=false
+  rules:
+    - if: $CI_COMMIT_BRANCH == "main" || $CI_COMMIT_TAG
+
+build-queue:
+  extends: .build-image
+  variables: { DOCKERFILE: queue/Dockerfile, IMAGE: flyc-queue }
+
+build-control:
+  extends: .build-image
+  variables: { DOCKERFILE: control/Dockerfile, IMAGE: flyc-control }
+
+# Playbooks embarqués : la version des playbooks suit celle des binaires, sans clone ni
+# identifiants git sur l'hôte control.
+build-runner:
+  extends: .build-image
+  variables: { DOCKERFILE: runner/Dockerfile, IMAGE: flyc-runner }
+
+deploy-test:
+  stage: deploy
+  image: python:3.12-slim
+  variables:
+    ANSIBLE_HOST_KEY_CHECKING: "False"
+  before_script:
+    - apt-get update -qq && apt-get install -y -qq --no-install-recommends openssh-client >/dev/null
+    - pip install -q ansible-core
+    - ansible-galaxy collection install -r edge/requirements.yml
+    - chmod 600 "$ANSIBLE_SSH_KEY"
+  script:
+    - ansible-playbook -i "$ANSIBLE_INVENTORY" edge/site.yml --private-key "$ANSIBLE_SSH_KEY" -e flyc_image_tag=${CI_COMMIT_TAG:-${CI_COMMIT_SHORT_SHA}}
+  rules:
+    # Sans inventaire configuré, le job n'existe pas : rien à déployer pour qui clone le dépôt.
+    - if: $CI_COMMIT_BRANCH == "main" && $ANSIBLE_INVENTORY
+      when: manual
+  environment:
+    name: test

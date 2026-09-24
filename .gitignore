@@ -1,0 +1,13 @@
+/build/
+/bin/
+# Les inventaires sont propres à chaque installation : seuls les exemples sont versionnés.
+inventory/*.yml
+!inventory/example-*.yml
+inventory/secrets*.yml
+!inventory/secrets.yml.example
+*.retry
+.env
+.DS_Store
+/wait/node_modules/
+.ansible/
+.flyc/

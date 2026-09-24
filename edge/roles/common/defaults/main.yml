@@ -1,0 +1,10 @@
+---
+common_packages:
+  - chrony
+  - ufw
+  - curl
+  - jq
+  - ca-certificates
+  - gnupg
+  - python3
+  - unattended-upgrades

@@ -1,0 +1,37 @@
+config_version: 2
+name: {{ inventory_hostname }}
+dataplaneapi:
+  host: {{ mgmt_ip }}
+  port: {{ flyc_dataplane_port }}
+  advertised:
+    api_address: ""
+    api_port: 0
+  scheme:
+  - http
+  userlist:
+    userlist: dataplaneapi
+    userlist_file: ""
+  transaction:
+    transaction_dir: /var/lib/dataplaneapi/transactions
+    backups_number: 10
+    backups_dir: /var/lib/dataplaneapi/backups
+  resources:
+    maps_dir: {{ haproxy_maps_dir }}
+    ssl_certs_dir: {{ haproxy_ssl_dir }}
+    general_storage_dir: {{ haproxy_etc }}/general
+    spoe_dir: {{ haproxy_etc }}/spoe
+haproxy:
+  config_file: {{ haproxy_etc }}/haproxy.cfg
+  haproxy_bin: /usr/sbin/haproxy
+  master_runtime: /run/haproxy-master.sock
+  reload:
+    reload_delay: 5
+    service_name: haproxy
+    reload_strategy: systemd
+log_targets:
+- log_to: file
+  log_file: /var/log/dataplaneapi.log
+  log_level: info
+  log_types:
+  - access
+  - app

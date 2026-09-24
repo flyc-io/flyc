@@ -1,0 +1,114 @@
+---
+# Rend haproxy.cfg, bird.conf, dataplaneapi.yml et le .env compose dans build/edge/
+# avec des chemins relatifs, pour `haproxy -c` en local et en CI.
+# Fixture all-in-one : -i tools/fixtures/inventory-all-in-one.yml -e render_edge_host=box -e render_queue_host=box -e build_dir=…
+- name: Rendu des templates edge (fixture)
+  hosts: "{{ render_edge_host | default('lbt0') }}"
+  connection: local
+  gather_facts: false
+  vars:
+    ansible_python_interpreter: "{{ ansible_playbook_python }}"
+  vars_files:
+    - ../edge/roles/flyc_defaults/defaults/main.yml
+    - ../edge/roles/haproxy/defaults/main.yml
+    - fixtures/render-vars.yml
+  tasks:
+    - name: Répertoires de rendu
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        mode: "0755"
+      loop:
+        - "{{ haproxy_etc }}/errors"
+        - "{{ haproxy_wait_dir }}"
+        - "{{ haproxy_ssl_dir }}"
+        - "{{ haproxy_maps_dir }}"
+        - "{{ haproxy_flyc_dir }}"
+        - "{{ haproxy_etc }}/general"
+      delegate_to: localhost
+
+    - name: Fichiers requis au parsing (maps, clé, cert, pages)
+      ansible.builtin.copy:
+        content: "{{ item.content }}"
+        dest: "{{ item.dest }}"
+        mode: "0644"
+      loop:
+        - { dest: "{{ haproxy_maps_dir }}/rooms.map", content: "billets.example.com demo-tenant/concert\n" }
+        - { dest: "{{ haproxy_maps_dir }}/states.map", content: "demo-tenant/concert queue\n" }
+        - { dest: "{{ haproxy_maps_dir }}/backends.map", content: "billets.example.com bk_demo\n" }
+      delegate_to: localhost
+
+    - name: Pages d'erreur et salle d'attente
+      ansible.builtin.copy:
+        src: "{{ item.src }}"
+        dest: "{{ item.dest }}"
+        mode: "0644"
+      loop:
+        - { src: "../edge/roles/haproxy/files/errors/503-no-backend.http", dest: "{{ haproxy_etc }}/errors/503-no-backend.http" }
+        - { src: "../edge/roles/haproxy/files/errors/429.http", dest: "{{ haproxy_etc }}/errors/429.http" }
+        - { src: "../wait/dist/", dest: "{{ haproxy_wait_dir }}/" }
+      delegate_to: localhost
+
+    - name: Clé publique et certificat de test
+      ansible.builtin.shell: |
+        set -e
+        cd "{{ haproxy_etc }}"
+        [ -f general/pass.pub ] || { openssl ecparam -name prime256v1 -genkey -noout -out /tmp/k.pem && openssl ec -in /tmp/k.pem -pubout -out general/pass.pub 2>/dev/null && rm /tmp/k.pem; }
+        [ -f general/pass-prev.pub ] || cp general/pass.pub general/pass-prev.pub
+        [ -f ssl/bootstrap.pem ] || { openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -days 1 -subj "/CN=fixture" -keyout /tmp/c.key -out /tmp/c.crt 2>/dev/null && cat /tmp/c.crt /tmp/c.key > ssl/bootstrap.pem && rm /tmp/c.key /tmp/c.crt; }
+        echo "{{ haproxy_ssl_dir }}/bootstrap.pem" > ssl/app.crt-list
+        echo "{{ haproxy_ssl_dir }}/bootstrap.pem" > ssl/wait.crt-list
+      changed_when: false
+      delegate_to: localhost
+
+    - name: haproxy.cfg
+      ansible.builtin.template:
+        src: ../edge/roles/haproxy/templates/haproxy.cfg.j2
+        dest: "{{ build_dir }}/haproxy.cfg"
+        mode: "0644"
+      delegate_to: localhost
+
+    - name: bird.conf
+      ansible.builtin.template:
+        src: ../edge/roles/bird/templates/bird.conf.j2
+        dest: "{{ build_dir }}/bird.conf"
+        mode: "0644"
+      delegate_to: localhost
+
+    - name: dataplaneapi.yml
+      ansible.builtin.template:
+        src: ../edge/roles/dataplaneapi/templates/dataplaneapi.yml.j2
+        dest: "{{ build_dir }}/dataplaneapi.yml"
+        mode: "0644"
+      delegate_to: localhost
+
+    - name: Adresses VIP à porter sur lo (même calcul que le rôle haproxy, sans facts)
+      ansible.builtin.set_fact:
+        flyc_lo_vips: >-
+          {{ ([flyc_vip_app.v4, flyc_vip_wait.v4, flyc_vip_app.v6 | default(''), flyc_vip_wait.v6 | default('')])
+             | select | unique | reject('in', host_addresses | default([])) | list }}
+
+    - name: netplan VIP
+      ansible.builtin.template:
+        src: ../edge/roles/haproxy/templates/netplan-vip.yaml.j2
+        dest: "{{ build_dir }}/60-flyc-vip.yaml"
+        mode: "0644"
+      delegate_to: localhost
+      when: flyc_lo_vips | length > 0
+
+- name: Rendu du .env compose (fixture, hôte qt0)
+  hosts: "{{ render_queue_host | default('qt0') }}"
+  connection: local
+  gather_facts: false
+  vars:
+    ansible_python_interpreter: "{{ ansible_playbook_python }}"
+  vars_files:
+    - ../edge/roles/flyc_defaults/defaults/main.yml
+    - fixtures/render-vars.yml
+  tasks:
+    - name: .env
+      ansible.builtin.template:
+        src: ../edge/roles/flyc_compose/templates/env.j2
+        dest: "{{ build_dir }}/compose.env"
+        mode: "0644"
+      delegate_to: localhost

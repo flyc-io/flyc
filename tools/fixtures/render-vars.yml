@@ -1,0 +1,4 @@
+# Surcharges pour le rendu local (chargé après group_vars/all.yml, donc prioritaire).
+build_dir: "{{ playbook_dir }}/../build/edge"
+haproxy_etc: "{{ build_dir }}/etc"
+haproxy_run_as_haproxy: false

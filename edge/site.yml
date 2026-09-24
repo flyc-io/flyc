@@ -1,0 +1,97 @@
+---
+# Ordre imposé : data (origine des secrets) → queue → edge en série.
+#
+# « !draining » : un nœud en cours de retrait reste dans l'inventaire — c'est par lui qu'on le
+# démonte — mais ne doit pas être réinstallé par un déploiement lancé entre-temps.
+- name: Secrets partagés (générés sur l'hôte data au premier run)
+  hosts: data
+  gather_facts: true
+  roles:
+    - role: flyc_defaults
+      tags: always
+    - role: common
+    # Les secrets sont la source de tout le reste : ils sont relus quel que soit le filtre de
+    # tags, sinon un passage ciblé (par exemple --tags firewall) trouverait flyc_secrets vide.
+    - role: secrets
+      tags: always
+
+# Stratégie « free » : ces hôtes n'ont aucune dépendance entre eux, chacun avance à son rythme au
+# lieu d'attendre le plus lent à chaque tâche. Les plays qui suivent (cluster Redis, LB en série)
+# restent en « linear » : ils s'appuient sur run_once et sur un ordre strict.
+- name: Hôtes queue et data (Docker + compose)
+  hosts: queue:data:!draining
+  # « free » : ces hôtes n'ont aucune dépendance entre eux. Avec l'accélérateur optionnel
+  # (tools/ansible-env.sh), c'est la variante mitogen_free qui est utilisée.
+  strategy: "{{ lookup('env', 'FLYC_PLAY_STRATEGY') | default('free', true) }}"
+  gather_facts: true
+  pre_tasks:
+    # La clé de déploiement est générée sur l'hôte control au play précédent ; les autres hôtes
+    # la reçoivent ici, avant que common ne pose le compte de déploiement.
+    - name: Clé publique de déploiement depuis l'hôte control
+      ansible.builtin.set_fact:
+        flyc_deploy_pubkey: "{{ hostvars[groups['data'][0]].flyc_deploy_pubkey | default('') }}"
+  roles:
+    - role: flyc_defaults
+    - role: common
+    - role: node_exporter
+    - role: docker
+    # Étiqueté : quand un hôte de file arrive ou part, les autres n'ont besoin que de leur
+    # nouvelle liste de nœuds (REDIS_ADDRS, FLYC_QUEUE_HOSTS), pas de toute la réinstallation.
+    - role: flyc_compose
+      tags: compose
+
+- name: Cluster Redis (bootstrap une fois tous les nœuds joignables)
+  hosts: queue:!draining
+  gather_facts: false
+  roles:
+    - role: flyc_defaults
+    - role: redis_cluster
+
+- name: Load balancers (HAProxy + BIRD + Dataplane API), un par un
+  hosts: edge:!draining
+  serial: 1
+  gather_facts: true
+  pre_tasks:
+    - name: Secrets partagés depuis l'hôte data (mot de passe Dataplane API, clé de déploiement)
+      ansible.builtin.set_fact:
+        flyc_secrets: "{{ hostvars[groups['data'][0]].flyc_secrets }}"
+        flyc_deploy_pubkey: "{{ hostvars[groups['data'][0]].flyc_deploy_pubkey | default('') }}"
+      no_log: true
+  roles:
+    - role: flyc_defaults
+    - role: common
+    - role: node_exporter
+    - role: haproxy
+    - role: bird
+    - role: dataplaneapi
+  post_tasks:
+    - name: Vérification finale du LB
+      ansible.builtin.include_tasks: tasks/verify_edge.yml
+
+- name: Récapitulatif
+  hosts: data
+  gather_facts: false
+  roles:
+    - role: flyc_defaults
+  tasks:
+    - name: Mot de passe initial de l'administrateur (présent seulement après le premier démarrage)
+      ansible.builtin.slurp:
+        src: "{{ flyc_data_dir }}/control/initial-admin-password.txt"
+      register: admin_pw
+      failed_when: false
+      no_log: true
+
+    - name: Fin
+      ansible.builtin.debug:
+        msg: |
+          Flyc {{ flyc_env }} déployé.
+            LB       : {{ groups['edge'] | join(', ') }}
+            Queue    : {{ groups['queue'] | join(', ') }}
+            Control  : https://{{ flyc_control_host }}  (compte initial : voir ci-dessous)
+            Attente  : https://{{ flyc_wait_host }}
+            Grafana  : http://{{ hostvars[groups['data'][0]].mgmt_ip }}:{{ flyc_grafana_port | default(3000) }}  (admin / GRAFANA_PASSWORD dans secrets.env)
+          {% if admin_pw.content is defined %}
+          {{ admin_pw.content | b64decode }}
+          {% else %}
+          Compte admin : déjà initialisé lors d'un run précédent (fichier retiré ou absent).
+          {% endif %}

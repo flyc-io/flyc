@@ -1,0 +1,13 @@
+{
+  "settings": {
+    "env": "box",
+    "wait_host": "wait.localhost",
+    "control_host": "control.localhost",
+    "queue_port": 8080,
+    "control_port": 8090,
+    "dataplane_port": 5555
+  },
+  "nodes": [
+    { "name": "box", "roles": ["edge", "queue", "data"], "mgmt_ip": "127.0.0.1", "state": "ready" }
+  ]
+}

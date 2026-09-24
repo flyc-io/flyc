@@ -1,0 +1,12 @@
+---
+- name: prometheus-node-exporter
+  ansible.builtin.apt:
+    lock_timeout: 600   # apt peut être tenu par unattended-upgrades sur une machine fraîche
+    name: prometheus-node-exporter
+    state: present
+
+- name: node_exporter actif
+  ansible.builtin.service:
+    name: prometheus-node-exporter
+    state: started
+    enabled: true

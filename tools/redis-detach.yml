@@ -1,0 +1,53 @@
+---
+# Sort du cluster Redis les nœuds d'un hôte de file qui s'en va : vidage des slots puis retrait.
+# Exécuté depuis un hôte de file qui reste, le seul à disposer du conteneur et du mot de passe.
+#
+#   ansible-playbook -i <inv> tools/redis-detach.yml -e detach_node=queue4
+- name: Sortie des nœuds Redis d'un hôte de file
+  hosts: "{{ (groups['queue'] | reject('equalto', detach_node) | list | first) | default('') }}"
+  gather_facts: false
+  become: true
+  roles:
+    - role: flyc_defaults
+  tasks:
+    - name: Hôte à retirer connu
+      ansible.builtin.assert:
+        that:
+          - detach_node is defined
+          - detach_node in groups['queue']
+          - groups['queue'] | length > 1
+        fail_msg: >-
+          detach_node doit désigner un hôte du groupe queue, et il doit en rester au moins un autre.
+
+    - name: Script de topologie Redis
+      ansible.builtin.copy:
+        src: "{{ playbook_dir }}/../edge/roles/redis_cluster/files/redis-topology.py"
+        dest: "{{ flyc_install_dir }}/redis-topology.py"
+        mode: "0750"
+        owner: root
+        group: flyc
+
+    # Le vidage déplace de vraies clés : compter quelques minutes par shard. Le service continue.
+    - name: Vidage des slots et retrait des nœuds
+      ansible.builtin.command:
+        cmd: >-
+          {{ flyc_install_dir }}/redis-topology.py detach
+          {{ mgmt_ip }}:{{ flyc_redis_node_ports[0] }}
+          {{ hostvars[detach_node].mgmt_ip }}
+      register: detach_out
+      changed_when: "'retiré du cluster' in detach_out.stdout"
+
+    - name: Résultat
+      ansible.builtin.debug:
+        msg: "{{ detach_out.stdout_lines }}"
+
+    # Après le départ d'un hôte, les répliques restantes peuvent se retrouver mal réparties.
+    - name: Topologie remise en forme
+      ansible.builtin.command:
+        cmd: "{{ flyc_install_dir }}/redis-topology.py balance {{ mgmt_ip }}:{{ flyc_redis_node_ports[0] }}"
+      register: balance_out
+      changed_when: "'bascule(s)' in balance_out.stdout or 'déplacement(s)' in balance_out.stdout"
+
+    - name: Topologie
+      ansible.builtin.debug:
+        msg: "{{ balance_out.stdout_lines }}"

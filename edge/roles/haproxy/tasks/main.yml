@@ -1,0 +1,280 @@
+---
+# Déclarer un PPA fait interroger l'API de Launchpad pour le résoudre. Cet appel sort de
+# l'infrastructure et répond parfois en dix secondes ou pas du tout, ce qui suffit à faire échouer
+# une installation par ailleurs saine. Le dépôt lui-même, lui, répond normalement.
+- name: PPA HAProxy 3.0 (paquets officiels de Vincent Bernat)
+  ansible.builtin.apt_repository:
+    repo: "{{ haproxy_ppa }}"
+    state: present
+    update_cache: true
+  register: haproxy_ppa_add
+  retries: 5
+  delay: 10
+  until: haproxy_ppa_add is succeeded
+
+- name: Paquet haproxy
+  ansible.builtin.apt:
+    lock_timeout: 600   # apt peut être tenu par unattended-upgrades sur une machine fraîche
+    name: "{{ haproxy_package }}"
+    state: present
+
+- name: Répertoires
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    owner: haproxy
+    group: haproxy
+    mode: "0750"
+  loop:
+    - "{{ haproxy_wait_dir }}"
+    - "{{ haproxy_ssl_dir }}"
+    - "{{ haproxy_maps_dir }}"
+    - "{{ haproxy_flyc_dir }}"
+    - "{{ haproxy_etc }}/general"
+    - "{{ haproxy_etc }}/spoe"
+
+- name: Fichiers de la salle d'attente
+  ansible.builtin.copy:
+    src: "{{ flyc_wait_files_src }}/"
+    dest: "{{ haproxy_wait_dir }}/"
+    owner: haproxy
+    group: haproxy
+    mode: "0640"
+  notify: reload haproxy
+
+- name: Maps (créées vides, remplies ensuite par flyc-control)
+  ansible.builtin.copy:
+    dest: "{{ haproxy_maps_dir }}/{{ item }}"
+    content: "# géré par flyc-control via la Dataplane API\n"
+    owner: haproxy
+    group: haproxy
+    mode: "0640"
+    force: false
+  loop: [rooms.map, states.map, backends.map]
+
+- name: Clé publique des pass depuis flyc-control (si joignable)
+  ansible.builtin.uri:
+    url: "http://{{ hostvars[groups['data'][0]].mgmt_ip }}:{{ flyc_control_port }}/.well-known/flyc-pass.pem"
+    return_content: true
+    status_code: 200
+  register: control_pubkey
+  failed_when: false
+  changed_when: false
+
+- name: Installation de la clé publique réelle (active et précédente identiques au bootstrap)
+  ansible.builtin.copy:
+    content: "{{ control_pubkey.content }}"
+    dest: "{{ haproxy_etc }}/general/{{ item }}"
+    owner: haproxy
+    group: haproxy
+    mode: "0640"
+    force: false
+  loop: [pass.pub, pass-prev.pub]
+  when: control_pubkey.status | default(0) == 200 and 'BEGIN PUBLIC KEY' in (control_pubkey.content | default(''))
+  notify: reload haproxy
+
+- name: "Clé publique placeholder (flyc-control injoignable : aucun pass ne sera accepté)"
+  ansible.builtin.shell: |
+    set -e
+    umask 077
+    openssl ecparam -name prime256v1 -genkey -noout -out /tmp/flyc-placeholder.key
+    openssl ec -in /tmp/flyc-placeholder.key -pubout -out {{ haproxy_etc }}/general/pass.pub
+    rm -f /tmp/flyc-placeholder.key
+    cp {{ haproxy_etc }}/general/pass.pub {{ haproxy_etc }}/general/pass-prev.pub
+    chown haproxy:haproxy {{ haproxy_etc }}/general/pass.pub {{ haproxy_etc }}/general/pass-prev.pub
+    chmod 0640 {{ haproxy_etc }}/general/pass.pub {{ haproxy_etc }}/general/pass-prev.pub
+  args:
+    creates: "{{ haproxy_etc }}/general/pass.pub"
+
+- name: pass-prev.pub présent (copie de l'active si absent)
+  ansible.builtin.shell: cp {{ haproxy_etc }}/general/pass.pub {{ haproxy_etc }}/general/pass-prev.pub && chown haproxy:haproxy {{ haproxy_etc }}/general/pass-prev.pub && chmod 0640 {{ haproxy_etc }}/general/pass-prev.pub
+  args:
+    creates: "{{ haproxy_etc }}/general/pass-prev.pub"
+
+- name: Certificat auto-signé de démarrage (remplacé par ACME via flyc-control)
+  ansible.builtin.shell: |
+    set -e
+    umask 077
+    openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -days 3650 \
+      -subj "/CN=flyc-bootstrap" -addext "subjectAltName=DNS:{{ flyc_wait_host }},DNS:{{ flyc_control_host }}" \
+      -keyout /tmp/flyc-boot.key -out /tmp/flyc-boot.crt
+    cat /tmp/flyc-boot.crt /tmp/flyc-boot.key > {{ haproxy_ssl_dir }}/bootstrap.pem
+    rm -f /tmp/flyc-boot.key /tmp/flyc-boot.crt
+    chown haproxy:haproxy {{ haproxy_ssl_dir }}/bootstrap.pem
+    chmod 0600 {{ haproxy_ssl_dir }}/bootstrap.pem
+  args:
+    creates: "{{ haproxy_ssl_dir }}/bootstrap.pem"
+
+- name: crt-lists (domaines protégés, salle d'attente) — complétées ensuite par flyc-control
+  ansible.builtin.copy:
+    dest: "{{ haproxy_ssl_dir }}/{{ item }}"
+    content: "{{ haproxy_ssl_dir }}/bootstrap.pem\n"
+    owner: haproxy
+    group: haproxy
+    mode: "0640"
+    force: false
+  loop: [app.crt-list, wait.crt-list]
+
+- name: rsyslog écoute HAProxy en UDP local et écrit /var/log/haproxy.log
+  ansible.builtin.copy:
+    dest: /etc/rsyslog.d/48-flyc-haproxy.conf
+    mode: "0644"
+    content: |
+      module(load="imudp")
+      input(type="imudp" address="127.0.0.1" port="514")
+      :programname, startswith, "haproxy" {
+        /var/log/haproxy.log
+        stop
+      }
+  notify: restart rsyslog
+
+- name: logrotate de haproxy.log
+  ansible.builtin.copy:
+    dest: /etc/logrotate.d/flyc-haproxy
+    mode: "0644"
+    content: |
+      /var/log/haproxy.log {
+        daily
+        rotate 14
+        compress
+        delaycompress
+        missingok
+        notifempty
+        postrotate
+          /usr/lib/rsyslog/rsyslog-rotate
+        endscript
+      }
+
+- name: Fichiers d'erreur
+  ansible.builtin.copy:
+    src: "errors/{{ item }}"
+    dest: "{{ haproxy_etc }}/errors/{{ item }}"
+    mode: "0644"
+  loop: [503-no-backend.http, 429.http]
+
+# haproxy.cfg est écrit par Ansible UNE FOIS (bootstrap). Ensuite, flyc-control le fait évoluer via la
+# Dataplane API (backends clients, certificats) : le réécrire effacerait ces changements.
+# Pour réappliquer le template (changement de global/defaults/frontends), passer -e haproxy_force_config=true ;
+# les backends déclarés via l'API devront alors être re-poussés par flyc-control.
+# Le paquet installe une haproxy.cfg par défaut : elle n'est pas « la nôtre ». Le template est écrit
+# tant que le fichier ne porte pas le marqueur Flyc ; ensuite seulement sur haproxy_force_config
+# (flyc-control fait évoluer le fichier via la Dataplane API, le réécrire effacerait les backends).
+- name: haproxy.cfg déjà écrite par Flyc ?
+  ansible.builtin.command: grep -q "Config de démarrage écrite par Ansible" {{ haproxy_etc }}/haproxy.cfg
+  register: haproxy_cfg_flyc
+  failed_when: false
+  changed_when: false
+  check_mode: false
+
+- name: haproxy.cfg (bootstrap, ou forcé par haproxy_force_config)
+  ansible.builtin.template:
+    src: haproxy.cfg.j2
+    dest: "{{ haproxy_etc }}/haproxy.cfg"
+    owner: root
+    group: haproxy
+    mode: "0640"
+    force: "{{ (haproxy_force_config | default(false) | bool) or (haproxy_cfg_flyc.rc != 0) }}"
+    validate: "haproxy -c -f %s"
+  when: haproxy_manage_config | bool
+  notify: reload haproxy
+
+# Les VIP déjà portées par une interface physique de l'hôte (all-in-one : la VIP est l'IP de la
+# machine) ne sont pas ajoutées sur lo. Les adresses de lo sont ignorées : ce sont les VIP posées
+# par un run précédent, elles doivent rester dans le fichier netplan.
+- name: Adresses des interfaces hors lo
+  ansible.builtin.shell: ip -o addr show scope global | awk '$2 != "lo" {print $4}' | cut -d/ -f1
+  register: host_addrs
+  changed_when: false
+  check_mode: false
+
+- name: Adresses VIP à porter sur lo
+  ansible.builtin.set_fact:
+    flyc_lo_vips: >-
+      {{ ([flyc_vip_app.v4, flyc_vip_wait.v4, flyc_vip_app.v6 | default(''), flyc_vip_wait.v6 | default('')])
+         | select | unique
+         | reject('in', host_addrs.stdout_lines) | list }}
+
+- name: Adresses VIP sur lo (netplan)
+  ansible.builtin.template:
+    src: netplan-vip.yaml.j2
+    dest: /etc/netplan/60-flyc-vip.yaml
+    mode: "0600"
+  register: netplan_vip
+  when: flyc_lo_vips | length > 0
+
+- name: Aucune VIP à porter sur lo (fichier netplan retiré)
+  ansible.builtin.file:
+    path: /etc/netplan/60-flyc-vip.yaml
+    state: absent
+  register: netplan_vip_absent
+  when: flyc_lo_vips | length == 0
+
+- name: netplan apply
+  ansible.builtin.command: netplan apply
+  when: netplan_vip.changed or netplan_vip_absent.changed
+
+- name: Routage de retour des VIP (drop-in systemd-networkd)
+  when: (flyc_vip_gateway.v4 | default('') | length > 0) or (flyc_vip_gateway.v6 | default('') | length > 0)
+  block:
+    # Le drop-in doit porter le nom exact de l'unité .network qui configure l'interface de sortie,
+    # sinon systemd-networkd l'ignore silencieusement. Ce nom dépend de la machine : une image
+    # cloud-init le fait générer par netplan (10-netplan-eth0.network), un conteneur peut avoir une
+    # unité écrite à la main (eth0.network). On le demande donc à networkd plutôt que de le supposer.
+    - name: Unité networkd qui configure l'interface portant {{ mgmt_ip }}
+      ansible.builtin.shell: |
+        set -eu
+        iface=$(ip -o -4 addr show | awk -v ip="{{ mgmt_ip }}" '$4 ~ "^"ip"/" {print $2; exit}')
+        [ -n "$iface" ] || { echo "aucune interface ne porte {{ mgmt_ip }}" >&2; exit 1; }
+        unit=$(networkctl status --no-pager "$iface" | sed -n 's/.*Network File: *//p' | head -1)
+        case "$unit" in /*) ;; *) echo "networkd ne déclare aucune unité pour $iface" >&2; exit 1;; esac
+        basename "$unit"
+      register: vip_unit_detect
+      changed_when: false
+      check_mode: false
+
+    - name: Nom de l'unité retenu
+      ansible.builtin.set_fact:
+        flyc_vip_unit: "{{ flyc_vip_network_unit | default('', true) | ternary(flyc_vip_network_unit, vip_unit_detect.stdout | trim) }}"
+
+    - name: Répertoire du drop-in
+      ansible.builtin.file:
+        path: "/etc/systemd/network/{{ flyc_vip_unit }}.d"
+        state: directory
+        mode: "0755"
+
+    - name: Règles et table de routage des VIP
+      ansible.builtin.template:
+        src: vip-routing.network.j2
+        dest: "/etc/systemd/network/{{ flyc_vip_unit }}.d/flyc-vip.conf"
+        mode: "0644"
+      register: vip_routing
+
+    # Un drop-in laissé sous un autre nom d'unité (inventaire modifié, machine réinstallée) ne
+    # s'applique pas mais prête à confusion : on le retire.
+    - name: Anciens drop-ins sous un autre nom d'unité
+      ansible.builtin.shell: |
+        find /etc/systemd/network -mindepth 2 -maxdepth 2 -name flyc-vip.conf \
+             -not -path "/etc/systemd/network/{{ flyc_vip_unit }}.d/*" -printf '%h\n' -delete
+      register: vip_stale
+      changed_when: vip_stale.stdout | trim | length > 0
+      check_mode: false
+
+    - name: networkctl reload
+      ansible.builtin.command: networkctl reload
+      when: vip_routing.changed or vip_stale.changed
+
+    - name: Règle de routage v4 en place
+      ansible.builtin.shell: ip rule show | grep -q "from {{ flyc_vip_app.v4 }} lookup {{ flyc_vip_route_table }}"
+      changed_when: false
+      check_mode: false
+      retries: 5
+      delay: 2
+      register: rule_ok
+      until: rule_ok.rc == 0
+      when: flyc_vip_gateway.v4 | default('') | length > 0
+
+- name: HAProxy actif
+  ansible.builtin.service:
+    name: haproxy
+    state: started
+    enabled: true

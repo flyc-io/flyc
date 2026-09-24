@@ -1,0 +1,42 @@
+---
+# Le pare-feu est calculé en une fois puis appliqué en un seul passage : une règle par appel ufw
+# faisait un aller-retour SSH chacune, soit le produit des hôtes par les ports (le poste le plus
+# coûteux du playbook, et qui croissait au carré de la taille de la plateforme).
+- name: "ufw : IPv6 activé"
+  ansible.builtin.lineinfile:
+    path: /etc/default/ufw
+    regexp: '^IPV6='
+    line: IPV6=yes
+
+# Gardé à part et jamais retiré par la synchronisation : se fermer l'accès SSH coûterait cher.
+- name: "ufw : SSH toujours autorisé"
+  community.general.ufw:
+    rule: allow
+    port: "22"
+    proto: tcp
+
+- name: "ufw : script de synchronisation"
+  ansible.builtin.copy:
+    src: ufw-sync.sh
+    dest: "{{ flyc_install_dir }}/ufw-sync.sh"
+    owner: root
+    group: root
+    mode: "0750"
+
+- name: "ufw : règles voulues pour cet hôte"
+  ansible.builtin.template:
+    src: ufw-rules.j2
+    dest: "{{ flyc_install_dir }}/ufw-rules.txt"
+    owner: root
+    group: root
+    mode: "0640"
+
+- name: "ufw : application de la différence"
+  ansible.builtin.shell: "{{ flyc_install_dir }}/ufw-sync.sh < {{ flyc_install_dir }}/ufw-rules.txt"
+  register: ufw_sync
+  changed_when: ufw_sync.stdout | trim | length > 0
+
+- name: "ufw : changements appliqués"
+  ansible.builtin.debug:
+    msg: "{{ ufw_sync.stdout_lines }}"
+  when: ufw_sync.stdout | trim | length > 0

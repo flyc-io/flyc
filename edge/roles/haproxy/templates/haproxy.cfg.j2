@@ -1,0 +1,227 @@
+# {{ ansible_managed }}
+# Config de démarrage écrite par Ansible. Après l'installation, flyc-control
+# fait évoluer ce fichier via la Dataplane API (domaines, backends, certificats).
+{% set vip_app = flyc_vip_app %}
+{% set vip_wait = flyc_vip_wait %}
+{% set same_vip = (vip_app.v4 == vip_wait.v4) %}
+{# Règles de la salle d'attente. `c` : condition préfixe (vide dans ft_wait, "is_wait " dans ft_app
+   quand app et wait partagent la même VIP). #}
+{% macro wait_rules(c) %}
+  acl is_api    path_beg /q/
+  acl is_ticket path_end /ticket
+  acl is_room   path_beg /w/
+  acl is_health path /healthz
+  acl is_jwks   path /.well-known/jwks.json
+
+  # Rate limiting sur la prise de ticket, partagé entre LB
+  # IPv4 : par adresse ; IPv6 : par /64 (un visiteur dispose de tout son préfixe)
+  http-request track-sc0 src,ipmask(32,64) table st_src if {{ c }}is_api is_ticket METH_POST
+  http-request deny deny_status 429 if {{ c }}is_api is_ticket { sc_http_req_rate(0) gt {{ haproxy_ticket_rate_limit }} }
+
+  # Mode dégradé : trop de connexions sur ce LB, flyc-queue passera les nouveaux en polling long
+  http-request set-header X-Flyc-Degraded 1 if {{ c }}{ fe_conn gt {{ haproxy_degrade_conn_threshold }} }
+
+  http-request return status 200 content-type "text/plain" string "ok" if {{ c }}is_health
+  http-request return status 200 content-type "text/html; charset=utf-8" file {{ haproxy_wait_dir }}/index.html hdr Cache-Control "no-store" if {{ c }}is_room
+  http-request return status 200 content-type "text/javascript; charset=utf-8" file {{ haproxy_wait_dir }}/app.js hdr Cache-Control "public, max-age=300" if {{ c }}{ path /app.js }
+  http-request return status 200 content-type "text/css; charset=utf-8" file {{ haproxy_wait_dir }}/app.css hdr Cache-Control "public, max-age=300" if {{ c }}{ path /app.css }
+  http-request return status 200 content-type "text/javascript; charset=utf-8" file {{ haproxy_wait_dir }}/widget.js hdr Cache-Control "public, max-age=300" hdr Access-Control-Allow-Origin "*" if {{ c }}{ path /widget.js }
+  # JWKS vivant depuis flyc-control (vérification des pass côté client, mode iframe / SDK)
+  http-response set-header Access-Control-Allow-Origin "*" if { var(txn.jwks) -m bool }
+  http-request set-var(txn.jwks) bool(true) if {{ c }}is_jwks
+
+  http-request return status 404 content-type "text/plain" string "not found" if {{ c }}!is_api !is_jwks
+{%- endmacro %}
+
+global
+  # Syslog en UDP local : fiable depuis le chroot (le socket /dev/log n'est pas toujours accessible en conteneur)
+  log 127.0.0.1:514 local0
+  chroot /var/lib/haproxy
+  stats socket /run/haproxy/admin.sock mode 660 level admin expose-fd listeners
+  stats timeout 30s
+{% if haproxy_run_as_haproxy | default(true) %}
+  user haproxy
+  group haproxy
+{% endif %}
+  daemon
+  localpeer {{ inventory_hostname }}
+  maxconn {{ haproxy_maxconn }}
+  tune.ssl.default-dh-param 2048
+  ssl-default-bind-ciphers ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305
+  ssl-default-bind-ciphersuites TLS_AES_128_GCM_SHA256:TLS_AES_256_GCM_SHA384:TLS_CHACHA20_POLY1305_SHA256
+  ssl-default-bind-options prefer-client-ciphers no-sslv3 no-tlsv10 no-tlsv11 no-tls-tickets
+
+defaults
+  log global
+  mode http
+  option httplog
+  option dontlognull
+  option forwardfor
+  option http-server-close
+  timeout connect 5s
+  timeout client 30s
+  timeout server 30s
+  timeout http-request 10s
+  timeout http-keep-alive 10s
+  timeout queue 10s
+  retries 2
+  errorfile 503 {{ haproxy_etc }}/errors/503-no-backend.http
+  errorfile 429 {{ haproxy_etc }}/errors/429.http
+
+# Utilisateur de la Dataplane API
+userlist dataplaneapi
+  user {{ dataplane_user }} insecure-password {{ flyc_secrets.DATAPLANE_PASSWORD }}
+
+# ------------------------------------------------------------------
+# Peers : stick-tables partagées entre les LB (rate limiting, compteurs)
+# ------------------------------------------------------------------
+peers flyc
+{% for h in groups['edge'] %}
+  peer {{ h }} {{ hostvars[h].mgmt_ip }}:{{ flyc_peers_port }}
+{% endfor %}
+
+backend st_src
+  stick-table type ipv6 size 1m expire 60s store http_req_rate(10s) peers flyc
+
+# ------------------------------------------------------------------
+# HTTP : challenges ACME vers flyc-control, tout le reste en HTTPS
+# ------------------------------------------------------------------
+frontend ft_http
+  bind {{ vip_app.v4 }}:80
+{% if vip_app.v6 %}
+  bind [{{ vip_app.v6 }}]:80
+{% endif %}
+{% if not same_vip %}
+  bind {{ vip_wait.v4 }}:80
+{% if vip_wait.v6 %}
+  bind [{{ vip_wait.v6 }}]:80
+{% endif %}
+{% endif %}
+  acl is_acme path_beg /.well-known/acme-challenge/
+  http-request redirect scheme https code 301 unless is_acme
+  use_backend bk_flyc_control if is_acme
+
+# ------------------------------------------------------------------
+# HTTPS domaines protégés + UI flyc-control
+# ------------------------------------------------------------------
+frontend ft_app
+{% set app_crt = haproxy_ssl_dir ~ '/app.crt-list' ~ (' crt-list ' ~ haproxy_ssl_dir ~ '/wait.crt-list' if same_vip else '') %}
+  bind {{ vip_app.v4 }}:443 ssl crt-list {{ app_crt }} alpn h2,http/1.1
+{% if vip_app.v6 %}
+  bind [{{ vip_app.v6 }}]:443 ssl crt-list {{ app_crt }} alpn h2,http/1.1
+{% endif %}
+{% if same_vip %}
+  timeout client 60s
+{% endif %}
+  http-request set-header X-Forwarded-Proto https
+  http-request set-header X-Real-IP %[src]
+
+  # Résolution du domaine
+  http-request set-var(txn.host)  req.hdr(host),field(1,:),lower
+  http-request set-var(txn.room)  var(txn.host),map_str({{ haproxy_maps_dir }}/rooms.map)
+  http-request set-var(txn.state) var(txn.room),map_str({{ haproxy_maps_dir }}/states.map,open)
+  acl is_control  var(txn.host) -m str {{ flyc_control_host }}
+  acl protected   var(txn.room) -m found
+  acl queue_on    var(txn.state) -m str queue
+  acl closed      var(txn.state) -m str closed
+  acl is_go       path /__flyc/go
+  acl go_r_ok     url_param(r),b64dec -m beg /
+{% if same_vip %}
+
+  # Même VIP pour app et wait : la salle d'attente est servie ici, par nom d'hôte
+  acl is_wait     var(txn.host) -m str {{ flyc_wait_host }}
+{{ wait_rules('is_wait ') }}
+{% endif %}
+
+  # Dépôt du pass sur le domaine du client : /__flyc/go?p=<pass>&r=<url base64>
+  http-request return status 302 content-type text/plain string "redirect" hdr Location "%[url_param(r),b64dec]" hdr Set-Cookie "flyc_pass=%[url_param(p)]; Path=/; Secure; HttpOnly; SameSite=Lax" hdr Cache-Control "no-store" if protected is_go go_r_ok
+  http-request return status 302 content-type text/plain string "redirect" hdr Location "/" hdr Set-Cookie "flyc_pass=%[url_param(p)]; Path=/; Secure; HttpOnly; SameSite=Lax" hdr Cache-Control "no-store" if protected is_go
+
+  # Vérification du pass (JWT ES256, clé publique locale, aucun appel réseau)
+  http-request set-var(txn.pass) req.cook(flyc_pass) if protected
+  # Deux clés acceptées : l'active et la précédente (rotation sans coupure). Fichiers poussés par flyc-control.
+  http-request set-var(txn.sig)  var(txn.pass),jwt_verify("ES256","{{ haproxy_etc }}/general/pass.pub") if protected
+  http-request set-var(txn.sig2) var(txn.pass),jwt_verify("ES256","{{ haproxy_etc }}/general/pass-prev.pub") if protected
+  http-request set-var(txn.exp)  var(txn.pass),jwt_payload_query('$.exp','int') if protected
+  http-request set-var(txn.dom)  var(txn.pass),jwt_payload_query('$.dom') if protected
+  http-request set-var(txn.prm)  var(txn.pass),jwt_payload_query('$.rm') if protected
+  http-request set-var(txn.now)  date() if protected
+  acl pass_ok    var(txn.sig) -m int 1
+  acl pass_ok    var(txn.sig2) -m int 1
+  acl pass_fresh var(txn.exp),sub(txn.now) gt 0
+  acl pass_dom   var(txn.dom),strcmp(txn.host) eq 0
+  acl pass_room  var(txn.prm),strcmp(txn.room) eq 0
+
+  # Redirections vers la salle d'attente
+  http-request redirect location https://{{ flyc_wait_host }}/w/%[var(txn.room)]?h=%[var(txn.host)]&r=%[url,base64] code 302 if protected queue_on !pass_ok
+  http-request redirect location https://{{ flyc_wait_host }}/w/%[var(txn.room)]?h=%[var(txn.host)]&r=%[url,base64] code 302 if protected queue_on !pass_fresh
+  http-request redirect location https://{{ flyc_wait_host }}/w/%[var(txn.room)]?h=%[var(txn.host)]&r=%[url,base64] code 302 if protected queue_on !pass_dom
+  http-request redirect location https://{{ flyc_wait_host }}/w/%[var(txn.room)]?h=%[var(txn.host)]&r=%[url,base64] code 302 if protected queue_on !pass_room
+  http-request redirect location https://{{ flyc_wait_host }}/w/%[var(txn.room)]?h=%[var(txn.host)]&closed=1 code 302 if protected closed
+
+  http-request set-header X-Flyc-Room %[var(txn.room)] if protected
+  http-request set-header X-Flyc-Pass-Sub %[var(txn.pass),jwt_payload_query('$.sub')] if protected pass_ok
+
+{% if same_vip %}
+  use_backend bk_flyc_control if is_wait is_jwks
+  use_backend bk_flyc_queue if is_wait is_api
+{% endif %}
+  use_backend bk_flyc_control if is_control
+  use_backend %[var(txn.host),map_str({{ haproxy_maps_dir }}/backends.map,bk_no_backend)]
+
+# ------------------------------------------------------------------
+# HTTPS salle d'attente : page statique servie ici, API /q/ vers flyc-queue
+# ------------------------------------------------------------------
+{% if same_vip %}
+# (même VIP que ft_app : la salle d'attente est servie par ft_app, par nom d'hôte)
+{% else %}
+frontend ft_wait
+  bind {{ vip_wait.v4 }}:443 ssl crt-list {{ haproxy_ssl_dir }}/wait.crt-list alpn h2,http/1.1
+{% if vip_wait.v6 %}
+  bind [{{ vip_wait.v6 }}]:443 ssl crt-list {{ haproxy_ssl_dir }}/wait.crt-list alpn h2,http/1.1
+{% endif %}
+  timeout client 60s
+  timeout http-request 10s
+  http-request set-header X-Forwarded-Proto https
+  http-request set-header X-Real-IP %[src]
+  compression algo gzip
+  compression type text/html text/css text/javascript application/javascript application/json
+{{ wait_rules('') }}
+  use_backend bk_flyc_control if is_jwks
+  use_backend bk_flyc_queue if is_api
+{% endif %}
+
+# ------------------------------------------------------------------
+# Backends plateforme
+# ------------------------------------------------------------------
+backend bk_flyc_queue
+  balance roundrobin
+  option httpchk GET /healthz
+  http-check expect status 200
+  timeout server 60s
+  default-server check inter 3s rise 2 fall 2 maxconn 100000
+{% for h in groups['queue'] %}
+  server {{ h }} {{ hostvars[h].mgmt_ip }}:{{ flyc_queue_port }}
+{% endfor %}
+
+backend bk_flyc_control
+  option httpchk GET /healthz
+  http-check expect status 200
+  default-server check inter 5s rise 2 fall 2
+{% for h in groups['data'] %}
+  server {{ h }} {{ hostvars[h].mgmt_ip }}:{{ flyc_control_port }}
+{% endfor %}
+
+backend bk_no_backend
+  http-request deny deny_status 503
+
+# ------------------------------------------------------------------
+# Stats et Prometheus (local)
+# ------------------------------------------------------------------
+frontend stats
+  bind 127.0.0.1:{{ flyc_stats_port }}
+  bind {{ mgmt_ip }}:{{ flyc_stats_port }}
+  http-request use-service prometheus-exporter if { path /metrics }
+  stats enable
+  stats uri /stats
+  stats refresh 10s

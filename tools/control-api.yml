@@ -1,0 +1,63 @@
+---
+# Appel de l'API de flyc-control depuis l'hôte data (le port 8090 n'est ouvert qu'en interne).
+# Utilisé par tools/add-node.sh ; la clé plateforme est lue sur l'hôte.
+#   -e api_method=POST -e api_path=/v1/backends [-e api_tenant=<slug>] [-e api_body='{…}']
+- name: Appel API flyc-control
+  hosts: "{{ groups['data'][0] }}"
+  gather_facts: false
+  vars:
+    api_method: GET
+    api_tenant: ""
+    api_body: ""
+    control_port: "{{ flyc_control_port | default(8090) }}"
+  tasks:
+    - name: Clé API plateforme
+      ansible.builtin.slurp:
+        src: /var/lib/flyc/control/initial-platform-api-key.txt
+      register: pk_raw
+      become: true
+      failed_when: false
+      no_log: true
+
+    - name: Clé disponible ?
+      ansible.builtin.fail:
+        msg: >-
+          Clé plateforme introuvable sur {{ inventory_hostname }}
+          (/var/lib/flyc/control/initial-platform-api-key.txt). Passer FLYC_PLATFORM_KEY dans
+          l'environnement, ou recréer une clé depuis l'interface d'administration.
+      when: (flyc_platform_key | default(lookup('env', 'FLYC_PLATFORM_KEY'), true) | default('', true)) == ''
+            and (pk_raw.content is not defined)
+
+    - name: Clé retenue
+      ansible.builtin.set_fact:
+        api_key: >-
+          {{ flyc_platform_key | default(lookup('env', 'FLYC_PLATFORM_KEY'), true)
+             | default((pk_raw.content | b64decode | regex_search('flyc_[0-9a-f]+')), true) }}
+      no_log: true
+
+    - name: "{{ api_method }} {{ api_path }}"
+      ansible.builtin.uri:
+        url: "http://127.0.0.1:{{ control_port }}{{ api_path }}"
+        method: "{{ api_method }}"
+        headers: >-
+          {{ {'Authorization': 'Bearer ' ~ api_key, 'Content-Type': 'application/json'}
+             | combine({'X-Flyc-Tenant': api_tenant} if api_tenant else {}) }}
+        body: "{{ api_body | default(omit, true) }}"
+        body_format: json
+        # Aucun code n'est une erreur pour le module : la tâche suivante rend le message lisible.
+        # (no_log masque cette tâche, dont les arguments portent la clé API.)
+        status_code: [200, 201, 202, 204, 400, 401, 403, 404, 409, 422, 500]
+        return_content: true
+      register: api_out
+      no_log: true
+
+    - name: Réponse
+      ansible.builtin.debug:
+        msg: "HTTP {{ api_out.status }} — {{ api_out.json | default(api_out.content, true) }}"
+
+    - name: Appel en échec
+      ansible.builtin.fail:
+        msg: >-
+          {{ api_method }} {{ api_path }} : HTTP {{ api_out.status }}
+          {{ api_out.json.message | default(api_out.json.error | default(api_out.content | default(''), true), true) }}
+      when: api_out.status not in [200, 201, 202, 204]

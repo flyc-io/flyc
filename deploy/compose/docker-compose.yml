@@ -1,0 +1,208 @@
+# Flyc — profils : queue (flyc-queue + 2 Redis), data (flyc-control + Postgres), all-in-one (tout + 6 Redis).
+# Réseau host pour Redis et flyc-queue : Redis Cluster annonce l'IP de l'hôte, HAProxy joint flyc-queue directement.
+
+x-redis: &redis
+  image: redis:7.4-alpine
+  network_mode: host
+  restart: unless-stopped
+  ulimits: { nofile: { soft: 65536, hard: 65536 } }
+  healthcheck:
+    test: ["CMD-SHELL", "redis-cli -p $$REDIS_PORT -a $$REDIS_PASSWORD --no-auth-warning ping | grep -q PONG"]
+    interval: 5s
+    timeout: 3s
+    retries: 10
+
+services:
+  redis-a:
+    <<: *redis
+    container_name: flyc-redis-a
+    profiles: [queue, all-in-one]
+    environment: { REDIS_PORT: "${REDIS_PORT_A:-7000}", REDIS_PASSWORD: "${REDIS_PASSWORD}" }
+    command: ["sh", "-c", "exec redis-server /etc/redis/redis.conf --port $$REDIS_PORT --cluster-announce-ip $$ANNOUNCE_IP --requirepass $$REDIS_PASSWORD --masterauth $$REDIS_PASSWORD"]
+    volumes: ["./redis/redis.conf:/etc/redis/redis.conf:ro", "${FLYC_DATA_DIR:-/var/lib/flyc}/redis-a:/data"]
+    env_file: [.env]
+  redis-b:
+    <<: *redis
+    container_name: flyc-redis-b
+    profiles: [queue, all-in-one]
+    environment: { REDIS_PORT: "${REDIS_PORT_B:-7001}", REDIS_PASSWORD: "${REDIS_PASSWORD}" }
+    command: ["sh", "-c", "exec redis-server /etc/redis/redis.conf --port $$REDIS_PORT --cluster-announce-ip $$ANNOUNCE_IP --requirepass $$REDIS_PASSWORD --masterauth $$REDIS_PASSWORD"]
+    volumes: ["./redis/redis.conf:/etc/redis/redis.conf:ro", "${FLYC_DATA_DIR:-/var/lib/flyc}/redis-b:/data"]
+    env_file: [.env]
+  redis-c:
+    <<: *redis
+    container_name: flyc-redis-c
+    profiles: [all-in-one]
+    environment: { REDIS_PORT: "7002", REDIS_PASSWORD: "${REDIS_PASSWORD}" }
+    command: ["sh", "-c", "exec redis-server /etc/redis/redis.conf --port $$REDIS_PORT --cluster-announce-ip $$ANNOUNCE_IP --requirepass $$REDIS_PASSWORD --masterauth $$REDIS_PASSWORD"]
+    volumes: ["./redis/redis.conf:/etc/redis/redis.conf:ro", "${FLYC_DATA_DIR:-/var/lib/flyc}/redis-c:/data"]
+    env_file: [.env]
+  redis-d:
+    <<: *redis
+    container_name: flyc-redis-d
+    profiles: [all-in-one]
+    environment: { REDIS_PORT: "7003", REDIS_PASSWORD: "${REDIS_PASSWORD}" }
+    command: ["sh", "-c", "exec redis-server /etc/redis/redis.conf --port $$REDIS_PORT --cluster-announce-ip $$ANNOUNCE_IP --requirepass $$REDIS_PASSWORD --masterauth $$REDIS_PASSWORD"]
+    volumes: ["./redis/redis.conf:/etc/redis/redis.conf:ro", "${FLYC_DATA_DIR:-/var/lib/flyc}/redis-d:/data"]
+    env_file: [.env]
+  redis-e:
+    <<: *redis
+    container_name: flyc-redis-e
+    profiles: [all-in-one]
+    environment: { REDIS_PORT: "7004", REDIS_PASSWORD: "${REDIS_PASSWORD}" }
+    command: ["sh", "-c", "exec redis-server /etc/redis/redis.conf --port $$REDIS_PORT --cluster-announce-ip $$ANNOUNCE_IP --requirepass $$REDIS_PASSWORD --masterauth $$REDIS_PASSWORD"]
+    volumes: ["./redis/redis.conf:/etc/redis/redis.conf:ro", "${FLYC_DATA_DIR:-/var/lib/flyc}/redis-e:/data"]
+    env_file: [.env]
+  redis-f:
+    <<: *redis
+    container_name: flyc-redis-f
+    profiles: [all-in-one]
+    environment: { REDIS_PORT: "7005", REDIS_PASSWORD: "${REDIS_PASSWORD}" }
+    command: ["sh", "-c", "exec redis-server /etc/redis/redis.conf --port $$REDIS_PORT --cluster-announce-ip $$ANNOUNCE_IP --requirepass $$REDIS_PASSWORD --masterauth $$REDIS_PASSWORD"]
+    volumes: ["./redis/redis.conf:/etc/redis/redis.conf:ro", "${FLYC_DATA_DIR:-/var/lib/flyc}/redis-f:/data"]
+    env_file: [.env]
+
+  flyc-queue:
+    image: ${FLYC_IMAGE_QUEUE}
+    container_name: flyc-queue
+    profiles: [queue, all-in-one]
+    network_mode: host
+    restart: unless-stopped
+    env_file: [.env]
+    environment:
+      FLYC_LISTEN: ":${QUEUE_PORT:-8080}"
+      FLYC_REDIS_ADDRS: "${REDIS_ADDRS}"
+      FLYC_REDIS_PASSWORD: "${REDIS_PASSWORD}"
+      FLYC_INTERNAL_TOKEN: "${INTERNAL_TOKEN}"
+      FLYC_CONTROL_URL: "${CONTROL_URL}"
+      FLYC_WAIT_HOST: "${FLYC_WAIT_HOST}"
+    ulimits: { nofile: { soft: 524288, hard: 524288 } }
+    healthcheck:
+      test: ["CMD", "/flyc-queue", "-healthcheck"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  postgres:
+    image: postgres:17-alpine
+    container_name: flyc-postgres
+    profiles: [data, all-in-one]
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: flyc
+      POSTGRES_USER: flyc
+      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD}"
+    volumes: ["${FLYC_DATA_DIR:-/var/lib/flyc}/postgres:/var/lib/postgresql/data"]
+    ports: ["127.0.0.1:${POSTGRES_PORT:-5432}:5432"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U flyc -d flyc"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  flyc-control:
+    image: ${FLYC_IMAGE_CONTROL}
+    container_name: flyc-control
+    profiles: [data, all-in-one]
+    restart: unless-stopped
+    depends_on:
+      postgres: { condition: service_healthy }
+    env_file: [.env]
+    environment:
+      FLYC_LISTEN: ":8090"
+      FLYC_DATABASE_URL: "postgres://flyc:${POSTGRES_PASSWORD}@postgres:5432/flyc?sslmode=disable"
+      FLYC_MASTER_KEY: "${FLYC_MASTER_KEY}"
+      FLYC_INTERNAL_TOKEN: "${INTERNAL_TOKEN}"
+      FLYC_DATA_DIR: /data
+      FLYC_JOBS_DIR: /jobs
+      FLYC_WAIT_HOST: "${FLYC_WAIT_HOST}"
+      FLYC_CONTROL_HOST: "${FLYC_CONTROL_HOST}"
+      # La topologie (LB, hôtes de file) vient de la base, plus de l'environnement. Ce fichier ne
+      # sert qu'au premier démarrage, pour amorcer les tables depuis l'inventaire d'installation.
+      FLYC_INVENTORY_SEED_FILE: /etc/flyc/inventory-seed.json
+      # Moitié publique de la clé de déploiement, pour le script d'enrôlement. La moitié privée
+      # n'est montée que dans le runner : control n'a aucune raison de la voir.
+      FLYC_DEPLOY_PUBKEY_FILE: /etc/flyc/deploy.pub
+      FLYC_DATAPLANE_USER: "${DATAPLANE_USER}"
+      FLYC_DATAPLANE_PASSWORD: "${DATAPLANE_PASSWORD}"
+      FLYC_ACME_EMAIL: "${FLYC_ACME_EMAIL:-}"
+      FLYC_ACME_DIRECTORY: "${FLYC_ACME_DIRECTORY:-}"
+      FLYC_PUBLIC_URL: "${FLYC_PUBLIC_URL:-}"
+      FLYC_OIDC_ISSUER: "${FLYC_OIDC_ISSUER:-}"
+      FLYC_OIDC_CLIENT_ID: "${FLYC_OIDC_CLIENT_ID:-}"
+      FLYC_OIDC_CLIENT_SECRET: "${FLYC_OIDC_CLIENT_SECRET:-}"
+      FLYC_OIDC_ADMIN_EMAILS: "${FLYC_OIDC_ADMIN_EMAILS:-}"
+      FLYC_COOKIE_SECURE: "${FLYC_COOKIE_SECURE:-true}"
+    volumes:
+      - "${FLYC_DATA_DIR:-/var/lib/flyc}/control:/data"
+      - "./inventory-seed.json:/etc/flyc/inventory-seed.json:ro"
+      - "${FLYC_DATA_DIR:-/var/lib/flyc}/deploy/id_ed25519.pub:/etc/flyc/deploy.pub:ro"
+      # Seul lien avec le runner : control y dépose ses demandes et y lit les journaux.
+      - "${FLYC_DATA_DIR:-/var/lib/flyc}/jobs:/jobs"
+    ports: ["${CONTROL_PORT:-8090}:8090"]
+    healthcheck:
+      test: ["CMD", "/flyc-control", "-healthcheck"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  # ---- profil monitoring (optionnel, hôte data) : Prometheus + Alertmanager + Grafana préconfigurés ----
+  # Exécute les playbooks pour le compte de flyc-control, qui en est incapable (Alpine sans Python
+  # ni SSH) et qui ne doit surtout pas voir la clé privée de déploiement. Les deux n'échangent que
+  # par le répertoire de tâches : ce protocole survit au redémarrage de control, ce qui arrive à
+  # chaque fois qu'un déploiement le vise.
+  flyc-runner:
+    image: ${FLYC_IMAGE_RUNNER}
+    container_name: flyc-runner
+    profiles: [data, all-in-one]
+    restart: unless-stopped
+    # Réseau de l'hôte : la clé de déploiement n'est acceptée que depuis l'adresse de control, et
+    # un conteneur en réseau bridge joint l'hôte lui-même avec une adresse 172.x, refusée. En
+    # réseau hôte l'adresse source est la même pour tous les nœuds, control0 compris. Le runner
+    # n'écoute sur aucun port, il ne fait que sortir.
+    network_mode: host
+    environment:
+      FLYC_JOBS_DIR: /var/lib/flyc/jobs
+      FLYC_RUNNER_DIR: /var/lib/flyc/runner
+      FLYC_DEPLOY_KEY: /var/lib/flyc/deploy/id_ed25519
+    volumes:
+      - "${FLYC_DATA_DIR:-/var/lib/flyc}/deploy:/var/lib/flyc/deploy:ro"
+      - "${FLYC_DATA_DIR:-/var/lib/flyc}/jobs:/var/lib/flyc/jobs"
+      - "${FLYC_DATA_DIR:-/var/lib/flyc}/runner:/var/lib/flyc/runner"
+
+  prometheus:
+    image: prom/prometheus:v2.55.1
+    container_name: flyc-prometheus
+    profiles: [monitoring]
+    restart: unless-stopped
+    command: ["--config.file=/etc/prometheus/prometheus.yml", "--storage.tsdb.retention.time=30d", "--web.enable-lifecycle"]
+    volumes:
+      - ./monitoring/prometheus:/etc/prometheus:ro
+      - ${FLYC_DATA_DIR:-/var/lib/flyc}/prometheus:/prometheus
+    ports: ["127.0.0.1:9090:9090"]
+  alertmanager:
+    image: prom/alertmanager:v0.27.0
+    container_name: flyc-alertmanager
+    profiles: [monitoring]
+    restart: unless-stopped
+    command: ["--config.file=/etc/alertmanager/alertmanager.yml", "--storage.path=/alertmanager"]
+    volumes:
+      - ./monitoring/alertmanager:/etc/alertmanager:ro
+      - ${FLYC_DATA_DIR:-/var/lib/flyc}/alertmanager:/alertmanager
+    ports: ["127.0.0.1:9093:9093"]
+  grafana:
+    image: grafana/grafana:11.3.1
+    container_name: flyc-grafana
+    profiles: [monitoring]
+    restart: unless-stopped
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: "${GRAFANA_PASSWORD:-admin}"
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_SERVER_ROOT_URL: "${GRAFANA_ROOT_URL:-http://localhost:3000}"
+    volumes:
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./monitoring/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - ${FLYC_DATA_DIR:-/var/lib/flyc}/grafana:/var/lib/grafana
+    ports: ["${GRAFANA_PORT:-3000}:3000"]

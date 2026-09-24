@@ -1,0 +1,189 @@
+---
+# La tache quotidienne d'Ubuntu (apt.systemd.daily) tient parfois le verrou apt plusieurs minutes,
+# et il lui arrive de rester bloquee sur une recuperation reseau. Sans cette attente, le playbook
+# echoue sur un message peu parlant ; ici on patiente, puis on dit quoi regarder.
+# Le verrou est pris en fcntl : flock ne le verrait pas (verrous BSD et POSIX sont independants).
+# Posé avant toute opération apt : c'est ce qui empêche une connexion perdue de figer le
+# déploiement (voir le fichier pour le détail).
+- name: Délais et tentatives d'apt
+  ansible.builtin.copy:
+    src: apt-flyc.conf
+    dest: /etc/apt/apt.conf.d/99-flyc
+    owner: root
+    group: root
+    mode: "0644"
+
+- name: Verrou apt libre
+  ansible.builtin.command:
+    argv:
+      - python3
+      - -c
+      - |
+        import fcntl, sys, time
+        paths = ("/var/lib/apt/lists/lock", "/var/lib/dpkg/lock-frontend")
+        deadline = time.time() + 300
+        while True:
+            busy = None
+            for p in paths:
+                try:
+                    f = open(p, "a")
+                except FileNotFoundError:
+                    continue
+                try:
+                    fcntl.lockf(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    fcntl.lockf(f, fcntl.LOCK_UN)
+                except OSError:
+                    busy = p
+                finally:
+                    f.close()
+                if busy:
+                    break
+            if not busy:
+                sys.exit(0)
+            if time.time() > deadline:
+                sys.exit("verrou apt (%s) tenu depuis plus de 5 min : voir docs/runbooks.md, "
+                         "section Deployer une version" % busy)
+            time.sleep(5)
+  changed_when: false
+  check_mode: false
+
+- name: Paquets de base
+  ansible.builtin.apt:
+    lock_timeout: 600   # apt peut être tenu par unattended-upgrades sur une machine fraîche
+    name: "{{ common_packages }}"
+    state: present
+    update_cache: true
+    cache_valid_time: 3600
+
+- name: chrony actif (les pass sont comparés à l'horloge du LB)
+  ansible.builtin.service:
+    name: chrony
+    state: started
+    enabled: true
+
+- name: Utilisateur système flyc
+  ansible.builtin.user:
+    name: flyc
+    system: true
+    shell: /usr/sbin/nologin
+    create_home: false
+
+# Compte de déploiement : control se connecte avec lui, jamais avec le compte d'administration.
+# Il faut être lucide sur ce qu'il apporte. Configurer une machine suppose d'installer des paquets
+# et d'écrire dans /etc : une liste blanche sudo serait un décor, « apt-get install » suffit à
+# devenir root. Ce compte est donc root par construction. Ce qu'on gagne est ailleurs, et c'est
+# réel : la clé n'ouvre rien d'autre qu'un accès de déploiement, elle n'est utilisable que depuis
+# l'hôte control, elle n'a pas de mot de passe, ses actions sont tracées sous une identité
+# distincte, et une seule rotation la révoque partout.
+- name: Compte de déploiement
+  ansible.builtin.user:
+    name: "{{ flyc_deploy_user }}"
+    system: true
+    shell: /bin/bash
+    home: "/var/lib/{{ flyc_deploy_user }}"
+    create_home: true
+    password: '!'          # aucun mot de passe : connexion par clé uniquement
+  when: flyc_deploy_pubkey | default('') | length > 0
+
+- name: Droits sudo du compte de déploiement
+  ansible.builtin.copy:
+    content: |
+      # Écrit par Ansible (rôle common) : ne pas modifier à la main.
+      # Configurer une machine demande les droits complets (paquets, services, /etc). Les
+      # restrictions utiles portent sur la clé, pas sur cette ligne : voir authorized_keys.
+      {{ flyc_deploy_user }} ALL=(root) NOPASSWD: ALL
+      Defaults:{{ flyc_deploy_user }} !requiretty
+    dest: "/etc/sudoers.d/{{ flyc_deploy_user }}"
+    mode: "0440"
+    validate: visudo -cf %s
+  when: flyc_deploy_pubkey | default('') | length > 0
+
+# La clé ne vaut que depuis l'hôte control, et n'autorise ni redirection de port, ni agent, ni
+# X11 : un vol du fichier authorized_keys ne donne rien de plus qu'un accès depuis cette machine.
+- name: Clé de déploiement autorisée (depuis l'hôte control uniquement)
+  ansible.posix.authorized_key:
+    user: "{{ flyc_deploy_user }}"
+    key: "{{ flyc_deploy_pubkey }}"
+    exclusive: true
+    key_options: >-
+      {{ ('from="' ~ flyc_deploy_from ~ '",') if (flyc_deploy_from | default('') | length > 0) else '' }}no-agent-forwarding,no-port-forwarding,no-X11-forwarding,no-user-rc
+  when: flyc_deploy_pubkey | default('') | length > 0
+
+- name: Répertoires flyc
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    owner: root
+    group: flyc
+    mode: "0750"
+  loop:
+    - "{{ flyc_install_dir }}"
+    - "{{ flyc_data_dir }}"
+
+# Les clés de l'espace de noms réseau s'appliquent partout ; les clés noyau (buffers, conntrack,
+# overcommit) ne sont modifiables que sur une vraie VM ou un serveur : en conteneur (LXC), c'est l'hôte qui les porte.
+- name: Conteneur ou machine ?
+  ansible.builtin.set_fact:
+    flyc_is_container: "{{ ansible_virtualization_role | default('') == 'guest' and ansible_virtualization_type | default('') in ['lxc', 'docker', 'container', 'podman', 'openvz'] }}"
+
+# Un fichier par famille plutôt qu'un appel par clé : la pose d'un sysctl coûtait un aller-retour
+# SSH chacune. Le rechargement n'a lieu que si un fichier a changé.
+- name: Réglages réseau (fichier sysctl)
+  ansible.builtin.template:
+    src: sysctl-netns.conf.j2
+    dest: /etc/sysctl.d/90-flyc.conf
+    mode: "0644"
+  register: sysctl_netns
+
+# nf_conntrack n'est chargé qu'au premier usage de netfilter : sur une VM vierge, son sysctl
+# n'existe pas encore. Chargé explicitement, et au démarrage.
+- name: Module nf_conntrack chargé au démarrage (edge, hors conteneur)
+  ansible.builtin.copy:
+    content: "nf_conntrack\n"
+    dest: /etc/modules-load.d/flyc.conf
+    mode: "0644"
+  when: "'edge' in group_names and not flyc_is_container"
+
+- name: Module nf_conntrack chargé maintenant (edge, hors conteneur)
+  community.general.modprobe:
+    name: nf_conntrack
+    state: present
+  when: "'edge' in group_names and not flyc_is_container"
+
+# Clés noyau (buffers, conntrack, overcommit) : modifiables seulement hors conteneur, où c'est
+# l'hôte qui les porte.
+- name: Réglages noyau (fichier sysctl, hors conteneur)
+  ansible.builtin.template:
+    src: sysctl-kernel.conf.j2
+    dest: /etc/sysctl.d/91-flyc-kernel.conf
+    mode: "0644"
+  register: sysctl_kernel
+  when: not flyc_is_container
+
+- name: Réglages sysctl appliqués
+  ansible.builtin.command: sysctl --system
+  changed_when: true
+  when: sysctl_netns.changed or (sysctl_kernel.changed | default(false))
+
+- name: Avertissement conteneur
+  ansible.builtin.debug:
+    msg: "{{ inventory_hostname }} est un conteneur ({{ ansible_virtualization_type }}) : les sysctl noyau (buffers, conntrack, overcommit) sont à poser sur l'hôte."
+  when: flyc_is_container
+
+- name: Limites de fichiers ouverts
+  community.general.pam_limits:
+    domain: "*"
+    limit_type: "{{ item }}"
+    limit_item: nofile
+    value: "1048576"
+  loop: [soft, hard]
+
+# Étiqueté : l'arrivée ou le départ d'un nœud ne change que le pare-feu des autres hôtes, on peut
+# donc se limiter à cela (« ansible-playbook … --tags firewall ») au lieu de tout reconverger.
+- name: Firewall
+  ansible.builtin.include_tasks:
+    file: firewall.yml
+    apply:
+      tags: [firewall]      # sans « apply », les tâches incluses n'héritent pas de l'étiquette
+  when: flyc_manage_firewall | bool
+  tags: firewall

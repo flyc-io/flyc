@@ -1,0 +1,29 @@
+# Installation minimale : une seule machine porte les trois rôles (LB, file, control), sans BGP.
+# HAProxy écoute directement sur l'IP de la machine (qui sert de VIP) ; les six nœuds Redis Cluster
+# tournent sur cette machine (ports 7000-7005) ; control, Postgres et la supervision aussi.
+# Dimensionnement indicatif : 4 vCPU, 8 Go, Ubuntu 24.04 vierge, ports 80/443 ouverts vers Internet.
+# Pas de redondance : pour la production, voir inventory/example-production.yml (2 LB + 3 queue + 1 control).
+all:
+  vars:
+    flyc_env: single
+    ansible_user: ubuntu
+    ansible_become: true
+    flyc_wait_host: wait.example.com        # DNS → 203.0.113.10
+    flyc_control_host: control.example.com  # DNS → 203.0.113.10 (UI servie par le LB, certificat ACME)
+    flyc_vip_app:  { v4: "203.0.113.10", v6: "" }
+    flyc_vip_wait: { v4: "203.0.113.10", v6: "" }
+    flyc_bgp: { enabled: false }
+    flyc_acme_email: ""                     # renseigner pour obtenir des certificats Let's Encrypt
+  children:
+    edge:
+      hosts:
+        box: { ansible_host: "203.0.113.10", mgmt_ip: "203.0.113.10", mgmt_ip6: "" }
+    queue:
+      hosts:
+        box:
+    data:
+      hosts:
+        box:
+    # Nœuds en cours de retrait : exclus des plays d'installation par edge/site.yml.
+    draining:
+      hosts: {}

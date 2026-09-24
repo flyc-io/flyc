@@ -1,0 +1,30 @@
+# Production : lb0 / lb1 existants + 3 hôtes queue. À n'utiliser qu'après validation sur test.
+all:
+  vars:
+    flyc_env: production
+    ansible_user: ubuntu
+    ansible_become: true
+    flyc_wait_host: wait.example.com
+    flyc_control_host: control.example.com
+    flyc_vip_app:  { v4: "203.0.113.2", v6: "2001:db8::2" }
+    flyc_vip_wait: { v4: "", v6: "" }   # À RENSEIGNER : VIP dédiée à la salle d'attente
+    flyc_bgp:
+      local_as: 64512
+      neighbors:
+        - { ip: "203.0.113.129", remote_as: 64497, family: v4 }
+        - { ip: "2001:db8:999::1", remote_as: 64497, family: v6 }
+    # lb0/lb1 ont déjà une config HAProxy pour d'autres services : le rôle haproxy
+    # ne réécrit haproxy.cfg que si haproxy_manage_config est vrai.
+    haproxy_manage_config: false
+  children:
+    edge:
+      hosts:
+        lb0: { ansible_host: "203.0.113.143", mgmt_ip: "203.0.113.143", mgmt_ip6: "2001:db8:999::143" }
+        lb1: { ansible_host: "203.0.113.144", mgmt_ip: "203.0.113.144", mgmt_ip6: "2001:db8:999::144" }
+    queue:
+      hosts: {}
+    data:
+      hosts: {}
+    # Nœuds en cours de retrait : exclus des plays d'installation par edge/site.yml.
+    draining:
+      hosts: {}

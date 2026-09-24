@@ -1,0 +1,59 @@
+---
+# Déclare (ou retire) un nœud sur les LB déjà en service, via la Dataplane API.
+# La Dataplane API écrit dans haproxy.cfg et recharge : le changement est persistant et sans coupure,
+# et il n'y a pas besoin de réécrire la configuration générée par Ansible (qui effacerait les
+# backends clients poussés par flyc-control).
+#
+# Un hôte queue devient un serveur de bk_flyc_queue ; un LB devient une entrée de la section peers
+# (stick-table de limitation partagée). Les deux sont rendus par le template lors d'une installation
+# neuve : l'inventaire reste la source de vérité, ceci ne fait que rattraper les LB déjà installés.
+#
+#   -e propagate_kind=queue|lb -e propagate_name=<nom> -e propagate_ip=<ip>
+#   -e propagate_targets=lb0,lb1   [-e propagate_state=present|absent]   (liste séparée par des virgules)
+- name: Propagation d'un nœud aux LB en service
+  hosts: "{{ groups['data'][0] }}"
+  gather_facts: false
+  vars:
+    propagate_state: present
+    peers_section: flyc
+    queue_backend: bk_flyc_queue
+  tasks:
+    - name: Paramètres fournis
+      ansible.builtin.assert:
+        that:
+          - propagate_kind in ['queue', 'lb']
+          - propagate_name | default('') | length > 0
+          - propagate_state in ['present', 'absent']
+        fail_msg: "propagate_kind (queue|lb), propagate_name et propagate_state sont requis"
+
+    - name: Mot de passe de la Dataplane API
+      ansible.builtin.slurp:
+        src: /opt/flyc/secrets.env
+      register: sec_raw
+      become: true
+      no_log: true
+
+    - name: Identifiants
+      ansible.builtin.set_fact:
+        dp_user: "{{ dataplane_user | default('flyc') }}"
+        dp_pass: "{{ (sec_raw.content | b64decode).split('\n') | select('match', '^DATAPLANE_PASSWORD=') | first | regex_replace('^DATAPLANE_PASSWORD=', '') }}"
+      no_log: true
+
+    - name: Cible et objet à écrire
+      ansible.builtin.set_fact:
+        dp_targets: "{{ propagate_targets | default('') | split(',') | map('trim') | select | reject('equalto', propagate_name) | list }}"
+        dp_path: >-
+          {{ '/services/haproxy/configuration/backends/' ~ queue_backend ~ '/servers'
+             if propagate_kind == 'queue'
+             else '/services/haproxy/configuration/peer_entries' }}
+        dp_query: "{{ '' if propagate_kind == 'queue' else 'peer_section=' ~ peers_section }}"
+        dp_port: "{{ flyc_queue_port | default(8080) if propagate_kind == 'queue' else flyc_peers_port | default(10000) }}"
+
+    - name: Rien à faire
+      ansible.builtin.meta: end_play
+      when: dp_targets | length == 0
+
+    - name: Traitement de chaque LB
+      ansible.builtin.include_tasks: propagate-node-edge.yml
+      loop: "{{ dp_targets }}"
+      loop_control: { loop_var: edge_name }

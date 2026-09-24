@@ -1,0 +1,67 @@
+# {{ ansible_managed }}
+# Annonce des VIP Flyc en BGP. Une session par voisin déclaré dans l'inventaire.
+{% set vips = [flyc_vip_app, flyc_vip_wait] | unique %}
+router id {{ mgmt_ip }};
+
+log syslog all;
+
+protocol device {
+    scan time 10;
+}
+
+protocol kernel kernel4 {
+    ipv4 { import all; export none; };
+}
+
+protocol kernel kernel6 {
+    ipv6 { import all; export none; };
+}
+
+protocol static static_flyc_v4 {
+    ipv4;
+{% for vip in vips if vip.v4 %}
+    route {{ vip.v4 }}/32 blackhole;
+{% endfor %}
+}
+
+protocol static static_flyc_v6 {
+    ipv6;
+{% for vip in vips if vip.v6 %}
+    route {{ vip.v6 }}/128 blackhole;
+{% endfor %}
+}
+
+filter export_flyc_v4 {
+    if proto = "static_flyc_v4" then accept;
+    reject;
+}
+
+filter export_flyc_v6 {
+    if proto = "static_flyc_v6" then accept;
+    reject;
+}
+
+{% for n in flyc_bgp.neighbors | default([]) %}
+protocol bgp peer_{{ n.family }}_{{ loop.index }} {
+    local as {{ flyc_bgp.local_as }};
+    neighbor {{ n.ip }} as {{ n.remote_as }};
+    source address {{ mgmt_ip6 if n.family == 'v6' else mgmt_ip }};
+    hold time {{ n.hold_time | default(90) }};
+    keepalive time {{ n.keepalive | default(30) }};
+    graceful restart on;
+{% if n.family == 'v6' %}
+    ipv6 {
+        import none;
+        export filter export_flyc_v6;
+        next hop self;
+    };
+{% else %}
+    ipv4 {
+        import none;
+        export filter export_flyc_v4;
+        next hop self;
+    };
+{% endif %}
+}
+
+{% endfor %}

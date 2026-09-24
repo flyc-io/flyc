@@ -1,0 +1,101 @@
+---
+# Valeurs par défaut communes (précédence la plus basse : tout inventaire les surcharge).
+# Rôle sans tâche, listé en premier dans chaque play de site.yml.
+
+# Ports et chemins (contrat entre les briques)
+flyc_queue_port: 8080          # flyc-queue : API publique /q/, /healthz, /metrics
+flyc_control_port: 8090        # flyc-control : UI, API, /internal/, /.well-known/acme-challenge/
+flyc_redis_ports: [7000, 7001]      # deux nœuds Redis par hôte queue
+flyc_redis_bus_ports: [17000, 17001] # bus cluster = port + 10000
+# Profil all-in-one : un seul hôte queue porte les six nœuds Redis (7000-7005), le LB et control.
+flyc_all_in_one: "{{ groups['queue'] | length == 1 }}"
+flyc_redis_node_ports: "{{ [7000, 7001, 7002, 7003, 7004, 7005] if (flyc_all_in_one | bool) else flyc_redis_ports }}"
+flyc_redis_node_bus_ports: "{{ flyc_redis_node_ports | map('int') | zip_longest([], fillvalue=10000) | map('sum') | list }}"
+flyc_postgres_port: 5432
+flyc_dataplane_port: 5555
+flyc_peers_port: 10000
+flyc_stats_port: 8404
+
+flyc_install_dir: /opt/flyc          # hôtes queue/data : compose + .env
+flyc_data_dir: /var/lib/flyc         # volumes (postgres, control)
+haproxy_etc: /etc/haproxy
+
+# HAProxy
+haproxy_ppa: "ppa:vbernat/haproxy-3.0"
+haproxy_package: "haproxy=3.0.*"
+haproxy_manage_config: true          # false sur un LB qui a déjà une config maison (lb0/lb1)
+haproxy_maxconn: 200000
+haproxy_degrade_conn_threshold: 150000   # au-delà : X-Flyc-Degraded (SSE → polling long)
+haproxy_ticket_rate_limit: 60            # POST /q/*/ticket par IP (ou /64) et par 10 s ; penser aux NAT partagés
+
+# Dataplane API
+dataplane_version: "3.2.6"
+dataplane_deb_url: "https://github.com/haproxytech/dataplaneapi/releases/download/v{{ dataplane_version }}/dataplaneapi_{{ dataplane_version }}_linux_amd64.deb"
+dataplane_user: flyc
+
+# BGP
+flyc_bgp:
+  enabled: true
+  local_as: 64512
+  neighbors: []
+
+# Routage de retour des VIP (policy routing). Quand la passerelle par défaut de l'hôte n'est pas
+# l'équipement qui reçoit les annonces BGP, les réponses sourcées par les VIP doivent repartir vers
+# ce dernier, sinon elles sont perdues (RPF, NAT). Vide = route par défaut symétrique, rien à faire.
+flyc_vip_gateway: { v4: "", v6: "" }
+flyc_vip_route_table: 100
+# Unité systemd-networkd de l'interface de sortie (le drop-in de routage est créé dessous).
+# Vide = détectée sur chaque hôte via networkctl : le nom diffère entre une machine gérée par
+# netplan (10-netplan-eth0.network) et une unité écrite à la main (eth0.network).
+flyc_vip_network_unit: ""
+
+# ACME (certificats des domaines clients et de la plateforme, HTTP-01 via les LB).
+# Vide = désactivé, les LB gardent le certificat de démarrage. Directory vide = Let's Encrypt production.
+flyc_acme_email: ""
+flyc_acme_directory: ""
+
+# Interface web de flyc-control.
+# URL publique (redirections OIDC) ; par défaut https://<flyc_control_host>. Mettre http://… si l'UI est servie en HTTP interne.
+flyc_control_public_url: ""
+# OIDC optionnel (Pocket ID, Keycloak, Authentik…). Vide = comptes locaux seulement.
+flyc_oidc: { issuer: "", client_id: "", client_secret: "", admin_emails: "" }
+# Cookie de session Secure : false uniquement si l'UI est servie en HTTP (test interne).
+flyc_cookie_secure: true
+
+# Supervision (profil compose monitoring sur l'hôte data) : Prometheus + Alertmanager + Grafana.
+flyc_monitoring: true
+flyc_grafana_port: 3000
+flyc_alert_webhook_url: ""      # récepteur Alertmanager (webhook) ; vide = alertes visibles mais non envoyées
+
+# Compte par lequel control se connecte aux nœuds (clé générée sur l'hôte control).
+# flyc_deploy_from restreint la provenance de la clé ; vide = aucune restriction de source.
+flyc_deploy_user: flyc-deploy
+flyc_deploy_from: ""
+
+# Firewall (ufw). Désactiver si un firewall amont est déjà en place.
+flyc_manage_firewall: true
+
+# Registre d'images signé par une CA privée : chemin local (côté Ansible) du certificat racine, vide sinon.
+flyc_registry_ca_file: ""
+# Même certificat, mais en contenu PEM : c'est la forme qu'emploie l'inventaire généré par control.
+flyc_registry_ca: ""
+
+# Registre et images. Un seul endroit à changer pour tirer d'ailleurs : miroir interne, registre
+# local monté par tools/install-control.sh --from-source, ou tout autre hôte.
+# ghcr.io plutôt que Docker Hub : pas de limite de tirage anonyme, et une installation en tire
+# déjà cinq images publiques (postgres, redis, prometheus, alertmanager, grafana).
+flyc_registry: ghcr.io/flyc-io
+
+# Épinglées par tag. Une installation nomme une version (v1.2.3) ; « latest » suit la dernière
+# version publiée, et -e flyc_pull_images=true force le re-téléchargement d'un tag mouvant.
+flyc_image_tag: latest
+flyc_pull_images: false
+
+flyc_image_queue: "{{ flyc_registry }}/flyc-queue:{{ flyc_image_tag }}"
+flyc_image_control: "{{ flyc_registry }}/flyc-control:{{ flyc_image_tag }}"
+# Image qui exécute les playbooks pour le compte de control (voir deploy/compose).
+flyc_image_runner: "{{ flyc_registry }}/flyc-runner:{{ flyc_image_tag }}"
+
+# Compose
+flyc_compose_project: flyc
+flyc_wait_files_src: "{{ playbook_dir }}/../wait/dist"

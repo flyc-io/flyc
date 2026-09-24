@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex">
+<title>Salle d'attente</title>
+<link rel="stylesheet" href="/app.css">
+</head>
+<body>
+<main class="room" id="room" data-state="loading">
+  <header class="brand"><span class="logo">Flyc</span><span class="site" id="site"></span></header>
+  <section class="card">
+    <p class="eyebrow" id="eyebrow">Salle d'attente</p>
+    <h1 id="title">Un instant, nous préparons votre place</h1>
+    <p class="lede" id="lede">Vous serez redirigé automatiquement. Ne rafraîchissez pas la page : votre place est conservée et cela ne change rien à votre position.</p>
+    <div class="stats" id="stats" hidden>
+      <div><span class="k">Position</span><b id="position">–</b></div>
+      <div><span class="k">Devant vous</span><b id="ahead">–</b></div>
+      <div><span class="k">Attente estimée</span><b id="eta">–</b></div>
+    </div>
+    <div class="bar" aria-hidden="true"><div class="fill" id="fill"></div></div>
+    <p class="hint" id="hint"></p>
+    <a class="go" id="go" href="#">Accéder au site</a>
+    <button class="retry" id="retry" type="button" hidden>Réessayer</button>
+  </section>
+  <footer class="foot"><span>Propulsé par Flyc</span><span id="ticket-id" class="mono"></span></footer>
+</main>
+<script src="/app.js"></script>
+</body>
+</html>

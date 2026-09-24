@@ -1,0 +1,11 @@
+# Généré par Ansible (edge/roles/flyc_compose/templates/alertmanager.yml.j2). Exemple sans récepteur.
+global:
+  resolve_timeout: 5m
+route:
+  receiver: default
+  group_by: [alertname, room, fqdn, instance]
+  group_wait: 30s
+  group_interval: 5m
+  repeat_interval: 4h
+receivers:
+  - name: default

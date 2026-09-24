@@ -1,0 +1,61 @@
+---
+# Un LB : lit la version et l'état courant, n'écrit que si nécessaire.
+- name: "{{ edge_name }} : URL de la Dataplane API"
+  ansible.builtin.set_fact:
+    dp_base: "http://{{ hostvars[edge_name].mgmt_ip }}:{{ flyc_dataplane_port | default(5555) }}/v3"
+
+- name: "{{ edge_name }} : version de configuration"
+  check_mode: false          # lecture seule : utile aussi en --check
+  ansible.builtin.uri:
+    url: "{{ dp_base }}/services/haproxy/configuration/version"
+    user: "{{ dp_user }}"
+    password: "{{ dp_pass }}"
+    force_basic_auth: true
+    return_content: true
+  register: dp_version
+  no_log: true
+
+- name: "{{ edge_name }} : entrées existantes"
+  check_mode: false          # lecture seule : utile aussi en --check
+  ansible.builtin.uri:
+    url: "{{ dp_base }}{{ dp_path }}{{ '?' ~ dp_query if dp_query else '' }}"
+    user: "{{ dp_user }}"
+    password: "{{ dp_pass }}"
+    force_basic_auth: true
+  register: dp_current
+  no_log: true
+
+- name: "{{ edge_name }} : état actuel du nœud"
+  ansible.builtin.set_fact:
+    dp_existing: "{{ (dp_current.json | default([])) | selectattr('name', 'equalto', propagate_name) | list }}"
+
+- name: "{{ edge_name }} : ajout de {{ propagate_name }}"
+  ansible.builtin.uri:
+    url: "{{ dp_base }}{{ dp_path }}?{{ (dp_query ~ '&') if dp_query else '' }}version={{ dp_version.content | trim }}"
+    method: POST
+    user: "{{ dp_user }}"
+    password: "{{ dp_pass }}"
+    force_basic_auth: true
+    body: { name: "{{ propagate_name }}", address: "{{ propagate_ip }}", port: "{{ dp_port | int }}" }
+    body_format: json
+    status_code: [200, 201, 202]
+  when: propagate_state == 'present' and dp_existing | length == 0
+
+- name: "{{ edge_name }} : retrait de {{ propagate_name }}"
+  ansible.builtin.uri:
+    url: "{{ dp_base }}{{ dp_path }}/{{ propagate_name }}?{{ (dp_query ~ '&') if dp_query else '' }}version={{ dp_version.content | trim }}"
+    method: DELETE
+    user: "{{ dp_user }}"
+    password: "{{ dp_pass }}"
+    force_basic_auth: true
+    status_code: [200, 202, 204]
+  when: propagate_state == 'absent' and dp_existing | length > 0
+
+- name: "{{ edge_name }} : état"
+  ansible.builtin.debug:
+    msg: >-
+      {{ edge_name }} : {{ propagate_name }}
+      {{ 'déjà présent, inchangé' if (propagate_state == 'present' and dp_existing | length > 0)
+         else ('déjà absent, inchangé' if (propagate_state == 'absent' and dp_existing | length == 0)
+         else (('à ajouter' if propagate_state == 'present' else 'à retirer') if ansible_check_mode
+         else ('ajouté' if propagate_state == 'present' else 'retiré'))) }}

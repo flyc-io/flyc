@@ -1,0 +1,53 @@
+{# {{ ansible_managed }}
+   Règles de pare-feu voulues pour cet hôte, en arguments ufw, une par ligne.
+   Lues par ufw-sync.sh, qui n'applique que la différence. L'accès SSH est géré à part pour
+   n'être jamais retiré. #}
+{% set is_edge = 'edge' in group_names %}
+{% set is_queue = 'queue' in group_names %}
+{% set is_data = 'data' in group_names %}
+{% macro from(ip, port) %}allow from {{ ip }} to any port {{ port }} proto tcp{% endmacro %}
+{% if is_edge %}
+allow 80/tcp
+allow 443/tcp
+{% if flyc_bgp.enabled | default(true) %}
+{% for n in flyc_bgp.neighbors | default([]) %}
+{{ from(n.ip, 179) }}
+{% endfor %}
+{% endif %}
+{% for h in groups['data'] %}
+{{ from(hostvars[h].mgmt_ip, flyc_dataplane_port) }}
+{% endfor %}
+{% for h in groups['edge'] if hostvars[h].mgmt_ip != mgmt_ip %}
+{{ from(hostvars[h].mgmt_ip, flyc_peers_port) }}
+{% endfor %}
+{% endif %}
+{% if is_queue %}
+{% for h in (groups['edge'] + groups['queue'] + groups['data']) | unique %}
+{% for p in [flyc_queue_port] + flyc_redis_node_ports + flyc_redis_node_bus_ports %}
+{{ from(hostvars[h].mgmt_ip, p) }}
+{% endfor %}
+{% endfor %}
+{% endif %}
+{% if is_data %}
+{% for h in (groups['edge'] + groups['queue']) | unique %}
+{{ from(hostvars[h].mgmt_ip, flyc_control_port) }}
+{% endfor %}
+{% endif %}
+{# Métriques : node_exporter et statistiques HAProxy, depuis les hôtes data (Prometheus) #}
+{% for h in groups['data'] %}
+{{ from(hostvars[h].mgmt_ip, 9100) }}
+{{ from(hostvars[h].mgmt_ip, flyc_stats_port) }}
+{% endfor %}
+{# Conteneurs de supervision : ils sortent en réseau bridge, donc avec une source 172.x #}
+{% if is_data and (flyc_monitoring | default(true)) %}
+{{ from('172.16.0.0/12', 9100) }}
+{{ from('172.16.0.0/12', flyc_control_port) }}
+allow {{ flyc_grafana_port | default(3000) }}/tcp
+{% endif %}
+{% if is_data and is_edge %}
+{{ from('172.16.0.0/12', flyc_dataplane_port) }}
+{{ from('172.16.0.0/12', flyc_stats_port) }}
+{% endif %}
+{% if is_data and is_queue %}
+{{ from('172.16.0.0/12', flyc_queue_port) }}
+{% endif %}
