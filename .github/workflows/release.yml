@@ -36,6 +36,10 @@ jobs:
             type=raw,value=${{ github.ref_name }}
             type=semver,pattern=v{{major}}.{{minor}}
             type=raw,value=latest
+          # Sans cela, l'étiquette porte la dernière valeur générée (v1.2) au lieu de la version
+          # exacte : une image ne dit alors pas de quelle version elle sort.
+          labels: |
+            org.opencontainers.image.version=${{ github.ref_name }}
 
       - uses: docker/build-push-action@v6
         with:
